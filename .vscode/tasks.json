@@ -1,0 +1,33 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Test rt",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "test",
+        "--package", "rt"
+      ],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "Deploy rt to ~/bin",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/deploy-rt.sh"
+      ],
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}
