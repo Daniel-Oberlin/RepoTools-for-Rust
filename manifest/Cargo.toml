@@ -1,0 +1,25 @@
+[package]
+name = "repotools_manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+md-5.workspace = true
+sha2.workspace = true
+digest.workspace = true
+base64.workspace = true
+regex.workspace = true
+walkdir.workspace = true
+unicode-normalization.workspace = true
+indexmap.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
