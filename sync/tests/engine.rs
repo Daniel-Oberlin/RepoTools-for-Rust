@@ -62,7 +62,7 @@ fn update_adds_source_only_to_dest() {
 
     assert!(dst.path().join("a.txt").is_file());
     assert!(dst.path().join("sub/b.txt").is_file());
-    assert!(compare_manifests(&source_manifest, &read_manifest(dst.path())).is_empty());
+    assert!(compare_manifests(&read_manifest(src.path()), &read_manifest(dst.path())).is_empty());
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn mirror_makes_dest_identical() {
         dst.path(),
         &[("a.txt", "A\n"), ("stale.txt", "remove me\n")],
     );
-    let source_manifest = build_repo(src.path(), &[("a.txt", "A\n"), ("b.txt", "B\n")]);
+    build_repo(src.path(), &[("a.txt", "A\n"), ("b.txt", "B\n")]);
 
     let mut source = LocalRepositoryProxy::open(src.path(), true).unwrap();
     let mut dest = LocalRepositoryProxy::open(dst.path(), false).unwrap();
@@ -117,7 +117,9 @@ fn mirror_makes_dest_identical() {
 
     assert!(dst.path().join("b.txt").is_file());
     assert!(!dst.path().join("stale.txt").exists()); // extra removed
-    assert!(compare_manifests(&source_manifest, &read_manifest(dst.path())).is_empty());
+                                                     // Compare against the source reloaded from disk so both sides use the same
+                                                     // (millisecond) date precision the engine itself compared with.
+    assert!(compare_manifests(&read_manifest(src.path()), &read_manifest(dst.path())).is_empty());
 }
 
 #[test]
@@ -157,7 +159,7 @@ fn mirror_applies_a_move() {
     let dst = tempfile::tempdir().unwrap();
     // Same content at different paths: a rename from dest's view.
     build_repo(dst.path(), &[("readme.txt", "same content\n")]);
-    let source_manifest = build_repo(src.path(), &[("docs/readme.txt", "same content\n")]);
+    build_repo(src.path(), &[("docs/readme.txt", "same content\n")]);
 
     let mut source = LocalRepositoryProxy::open(src.path(), true).unwrap();
     let mut dest = LocalRepositoryProxy::open(dst.path(), false).unwrap();
@@ -175,5 +177,5 @@ fn mirror_applies_a_move() {
 
     assert!(dst.path().join("docs/readme.txt").is_file());
     assert!(!dst.path().join("readme.txt").exists());
-    assert!(compare_manifests(&source_manifest, &read_manifest(dst.path())).is_empty());
+    assert!(compare_manifests(&read_manifest(src.path()), &read_manifest(dst.path())).is_empty());
 }
