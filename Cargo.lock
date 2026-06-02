@@ -614,6 +614,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "repotools_sync"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "repotools_manifest",
+ "tempfile",
+]
+
+[[package]]
+name = "rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "predicates",
+ "repotools_manifest",
+ "repotools_sync",
+ "tempfile",
+]
+
+[[package]]
 name = "rt"
 version = "0.1.0"
 dependencies = [

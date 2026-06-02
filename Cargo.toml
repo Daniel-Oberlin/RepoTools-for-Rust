@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["manifest", "rt"]
+members = ["manifest", "sync", "rt", "rs"]
 
 [workspace.package]
 version = "0.1.0"
