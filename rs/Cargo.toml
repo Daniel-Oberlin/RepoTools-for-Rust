@@ -1,0 +1,22 @@
+[package]
+name = "rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rs"
+path = "src/main.rs"
+
+[dependencies]
+repotools_manifest = { path = "../manifest" }
+repotools_sync = { path = "../sync" }
+clap.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd.workspace = true
+predicates.workspace = true
