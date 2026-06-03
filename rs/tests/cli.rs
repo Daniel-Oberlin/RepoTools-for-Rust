@@ -190,3 +190,61 @@ fn mirror_removes_extra_destination_files() {
         .success()
         .stdout(predicate::str::contains("No differences."));
 }
+
+#[test]
+fn detail_lists_differing_files() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    build_repo(src.path(), &[("a.txt", "A\n"), ("b.txt", "B\n")]);
+    rs().args(["seed"])
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+
+    rs().args(["diff", "--detail"])
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("./a.txt").and(predicate::str::contains("./b.txt")));
+}
+
+#[test]
+fn silent_suppresses_output_but_keeps_exit_code() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    build_repo(src.path(), &[("a.txt", "A\n")]);
+    rs().args(["seed"])
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+
+    // Differences exist (dst is empty): exit code is non-zero but nothing prints.
+    rs().args(["diff", "--silent"])
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn time_reports_duration() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    build_repo(src.path(), &[("a.txt", "A\n")]);
+    rs().args(["seed"])
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+
+    rs().args(["update", "--time"])
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Duration:"));
+}

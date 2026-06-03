@@ -4,8 +4,11 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use repotools_manifest::serde_fmt::dotnet_min_date;
+use repotools_manifest::{io as manifest_io, HashType, Manifest, DEFAULT_MANIFEST_FILE_NAME};
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 fn rt(dir: &Path) -> Command {
@@ -20,6 +23,17 @@ fn write(dir: &Path, rel: &str, contents: &str) {
         fs::create_dir_all(p).unwrap();
     }
     fs::write(path, contents).unwrap();
+}
+
+fn manifest(dir: &Path) -> Manifest {
+    manifest_io::read_manifest(&dir.join(DEFAULT_MANIFEST_FILE_NAME)).unwrap()
+}
+
+/// Sets a file's last-modified time well into the past (beyond the 2 s tolerance).
+fn set_old_mtime(path: &Path) {
+    let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+    let old = SystemTime::now() - Duration::from_secs(3600);
+    f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
 }
 
 /// create → the manifest file exists and a clean status reports nothing.
@@ -246,4 +260,289 @@ fn cascade_descends_into_nested_repositories() {
         .args(["status", "--recursive", "--cascade"])
         .assert()
         .stdout(predicate::str::contains("files were checked.").count(2));
+}
+
+// --- coverage for the remaining options ------------------------------------
+
+#[test]
+fn silent_suppresses_output() {
+    let dir = TempDir::new().unwrap();
+    make_repo(dir.path(), &[("a.txt", "A\n")]);
+    rt(dir.path())
+        .args(["status", "--silent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn time_reports_duration() {
+    let dir = TempDir::new().unwrap();
+    make_repo(dir.path(), &[("a.txt", "A\n")]);
+    rt(dir.path())
+        .args(["status", "--time"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Duration:"));
+}
+
+#[test]
+fn show_progress_lists_each_file() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "a.txt", "A\n");
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path())
+        .args(["update", "--show-progress"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("./a.txt [NEW]"));
+}
+
+#[test]
+fn description_round_trips_through_info() {
+    let dir = TempDir::new().unwrap();
+    rt(dir.path())
+        .args(["create", "--description", "My repository"])
+        .assert()
+        .success();
+    rt(dir.path())
+        .arg("info")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("My repository"));
+}
+
+#[test]
+fn all_lists_ignored_files_in_detail() {
+    let dir = TempDir::new().unwrap();
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path())
+        .args(["edit", "--ignore", r"\.log$"])
+        .assert()
+        .success();
+    write(dir.path(), "keep.txt", "keep\n");
+    write(dir.path(), "noise.log", "ignore me\n");
+    rt(dir.path()).arg("update").assert().success();
+
+    rt(dir.path())
+        .args(["status", "--detail", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("./noise.log"));
+}
+
+#[test]
+fn ignore_new_clears_validate_exit_code() {
+    let dir = TempDir::new().unwrap();
+    make_repo(dir.path(), &[("a.txt", "A\n")]);
+    write(dir.path(), "fresh.txt", "new\n");
+
+    // A new file makes validate fail...
+    rt(dir.path()).arg("validate").assert().failure();
+    // ...unless --ignore-new is given.
+    rt(dir.path())
+        .args(["validate", "--ignore-new"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No problems."));
+}
+
+#[test]
+fn ignore_date_clears_validate_exit_code() {
+    let dir = TempDir::new().unwrap();
+    make_repo(dir.path(), &[("a.txt", "A\n")]);
+    set_old_mtime(&dir.path().join("a.txt"));
+
+    // A date-only change makes validate fail...
+    rt(dir.path()).arg("validate").assert().failure();
+    // ...unless --ignore-date is given (and --no-touch so the date isn't reset).
+    rt(dir.path())
+        .args(["validate", "--ignore-date", "--no-touch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No problems."));
+}
+
+#[test]
+fn back_date_resets_file_date() {
+    let dir = TempDir::new().unwrap();
+    make_repo(dir.path(), &[("a.txt", "A\n")]);
+    set_old_mtime(&dir.path().join("a.txt"));
+
+    // First validate reports the date difference and back-dates the file.
+    rt(dir.path())
+        .args(["validate", "--back-date"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("last-modified"));
+    // The file date now matches the manifest, so a fresh validate is clean.
+    rt(dir.path())
+        .arg("validate")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No problems."));
+}
+
+#[test]
+fn no_touch_leaves_validation_date_unset() {
+    let dir = TempDir::new().unwrap();
+    make_repo(dir.path(), &[("a.txt", "A\n")]);
+
+    rt(dir.path())
+        .args(["validate", "--no-touch"])
+        .assert()
+        .success();
+    assert_eq!(
+        manifest(dir.path()).last_validate_date_utc,
+        dotnet_min_date()
+    );
+
+    // A plain validate does record the validation date.
+    rt(dir.path()).arg("validate").assert().success();
+    assert_ne!(
+        manifest(dir.path()).last_validate_date_utc,
+        dotnet_min_date()
+    );
+}
+
+#[test]
+fn dont_ignore_removes_a_pattern() {
+    let dir = TempDir::new().unwrap();
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path())
+        .args(["edit", "--ignore", r"\.tmp$"])
+        .assert()
+        .success();
+    assert!(manifest(dir.path())
+        .ignore_list
+        .contains(&r"\.tmp$".to_string()));
+
+    rt(dir.path())
+        .args(["edit", "--dont-ignore", r"\.tmp$"])
+        .assert()
+        .success();
+    assert!(!manifest(dir.path())
+        .ignore_list
+        .contains(&r"\.tmp$".to_string()));
+}
+
+#[test]
+fn ignore_default_resets_the_ignore_list() {
+    let dir = TempDir::new().unwrap();
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path())
+        .args(["edit", "--ignore", r"\.tmp$"])
+        .assert()
+        .success();
+
+    rt(dir.path())
+        .args(["edit", "--ignore-default"])
+        .assert()
+        .success();
+    let list = manifest(dir.path()).ignore_list;
+    assert!(!list.contains(&r"\.tmp$".to_string()));
+    assert!(list.contains(&r"^\./\.repositoryManifest$".to_string()));
+}
+
+#[test]
+fn new_hash_recomputes_with_default_method() {
+    let dir = TempDir::new().unwrap();
+    make_repo(dir.path(), &[("a.txt", "A\n")]); // MD5 by default
+    assert_eq!(
+        manifest(dir.path())
+            .get_file("./a.txt")
+            .unwrap()
+            .file_hash
+            .as_ref()
+            .unwrap()
+            .hash_type,
+        HashType::Md5
+    );
+
+    // Change the default method (no rescan), then recompute all hashes.
+    rt(dir.path())
+        .args(["edit", "--hash-method", "SHA256"])
+        .assert()
+        .success();
+    rt(dir.path())
+        .args(["update", "--new-hash"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        manifest(dir.path())
+            .get_file("./a.txt")
+            .unwrap()
+            .file_hash
+            .as_ref()
+            .unwrap()
+            .hash_type,
+        HashType::Sha256
+    );
+    rt(dir.path())
+        .arg("validate")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No problems."));
+}
+
+#[test]
+fn re_hash_detects_change_a_plain_status_would_skip() {
+    let dir = TempDir::new().unwrap();
+    make_repo(dir.path(), &[("a.txt", "aaaa")]);
+
+    // Same length, same (within-tolerance) mtime, different content: a plain
+    // status skips re-hashing and sees nothing...
+    write(dir.path(), "a.txt", "bbbb");
+    rt(dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed content").not());
+    // ...but --re-hash forces the hash check and detects it.
+    rt(dir.path())
+        .args(["status", "--re-hash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 files have changed content."));
+}
+
+#[test]
+fn manifest_file_writes_to_custom_path() {
+    let dir = TempDir::new().unwrap();
+    rt(dir.path())
+        .args(["create", "--manifest-file", "custom.manifest"])
+        .assert()
+        .success();
+
+    assert!(dir.path().join("custom.manifest").is_file());
+    assert!(!dir.path().join(DEFAULT_MANIFEST_FILE_NAME).exists());
+
+    rt(dir.path())
+        .args(["info", "--manifest-file", "custom.manifest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GUID:"));
+}
+
+#[test]
+fn confirm_update_can_decline_the_write() {
+    let dir = TempDir::new().unwrap();
+    rt(dir.path()).arg("create").assert().success();
+
+    // Declining the prompt leaves the manifest unchanged.
+    rt(dir.path())
+        .args(["edit", "--name", "Renamed", "--confirm-update"])
+        .write_stdin("n\n")
+        .assert()
+        .success();
+    assert_eq!(manifest(dir.path()).name, None);
+
+    // Confirming applies the edit.
+    rt(dir.path())
+        .args(["edit", "--name", "Renamed", "--confirm-update"])
+        .write_stdin("y\n")
+        .assert()
+        .success();
+    assert_eq!(manifest(dir.path()).name.as_deref(), Some("Renamed"));
 }
