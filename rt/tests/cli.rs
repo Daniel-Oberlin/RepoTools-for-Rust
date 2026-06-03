@@ -186,3 +186,64 @@ fn rejects_invalid_hash_method() {
         .failure()
         .stdout(predicate::str::contains("Unrecognized hash method"));
 }
+
+/// Creates a repository (manifest + files) rooted at `dir`.
+fn make_repo(dir: &Path, files: &[(&str, &str)]) {
+    fs::create_dir_all(dir).unwrap();
+    for (rel, content) in files {
+        write(dir, rel, content);
+    }
+    rt(dir).arg("create").assert().success();
+    rt(dir).arg("update").assert().success();
+}
+
+#[test]
+fn recursive_processes_every_manifest() {
+    // Two independent repositories at different depths under a parent that is
+    // not itself a repository.
+    let parent = TempDir::new().unwrap();
+    make_repo(&parent.path().join("alpha"), &[("a.txt", "A\n")]);
+    make_repo(&parent.path().join("nested/beta"), &[("b.txt", "B\n")]);
+
+    // `--recursive` from the parent finds and validates both manifests.
+    rt(parent.path())
+        .args(["validate", "--recursive"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No problems.").count(2));
+}
+
+#[test]
+fn recursive_without_recursive_flag_uses_cwd_only() {
+    // The parent has no manifest of its own; a plain status there fails to read.
+    let parent = TempDir::new().unwrap();
+    make_repo(&parent.path().join("alpha"), &[("a.txt", "A\n")]);
+
+    rt(parent.path())
+        .arg("status")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Could not read manifest"));
+}
+
+#[test]
+fn cascade_descends_into_nested_repositories() {
+    // An outer repository that itself contains an inner repository.
+    let parent = TempDir::new().unwrap();
+    let outer = parent.path().join("outer");
+    make_repo(&outer, &[("top.txt", "T\n")]);
+    make_repo(&outer.join("inner"), &[("deep.txt", "D\n")]);
+
+    // Each processed manifest prints a "files were checked." summary. Without
+    // --cascade, recursion stops at the outer manifest (one repo processed).
+    rt(parent.path())
+        .args(["status", "--recursive"])
+        .assert()
+        .stdout(predicate::str::contains("files were checked.").count(1));
+
+    // With --cascade, it descends into the nested repository as well (two).
+    rt(parent.path())
+        .args(["status", "--recursive", "--cascade"])
+        .assert()
+        .stdout(predicate::str::contains("files were checked.").count(2));
+}
