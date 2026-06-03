@@ -2,12 +2,14 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Test rt",
+      "label": "Test rt and rs",
       "type": "shell",
       "command": "cargo",
       "args": [
         "test",
-        "--package", "rt"
+        "--tests",
+        "--package", "rt",
+        "--package", "rs"
       ],
       "group": {
         "kind": "test",
@@ -20,7 +22,7 @@
       }
     },
     {
-      "label": "Deploy rt to ~/bin",
+      "label": "Deploy rt and rs to ~/bin",
       "type": "shell",
       "command": "bash",
       "args": [
