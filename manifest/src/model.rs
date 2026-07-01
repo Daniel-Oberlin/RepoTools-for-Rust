@@ -34,9 +34,19 @@ impl FileHash {
 
     /// Computes the hash of a file using the given algorithm.
     pub fn compute(path: &Path, hash_type: HashType) -> io::Result<Self> {
+        FileHash::compute_with_progress(path, hash_type, None)
+    }
+
+    /// Computes the hash of a file and reports integer percent completion
+    /// (0..=100) while bytes are read.
+    pub fn compute_with_progress(
+        path: &Path,
+        hash_type: HashType,
+        on_progress: Option<&mut dyn FnMut(u8)>,
+    ) -> io::Result<Self> {
         Ok(FileHash::new(
             hash_type,
-            hash::compute_file(path, hash_type)?,
+            hash::compute_file_with_progress(path, hash_type, on_progress)?,
         ))
     }
 

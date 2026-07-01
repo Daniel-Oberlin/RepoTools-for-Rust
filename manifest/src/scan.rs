@@ -99,6 +99,19 @@ pub fn scan(
     ignore: &IgnoreSet,
     manifest_abs_path: &Path,
 ) -> ScanResult {
+    scan_with_progress(root, manifest, opts, ignore, manifest_abs_path, None)
+}
+
+/// Like [`scan`], but optionally emits each progress line as soon as it is
+/// produced.
+pub fn scan_with_progress(
+    root: &Path,
+    manifest: &mut Manifest,
+    opts: &ScanOptions,
+    ignore: &IgnoreSet,
+    manifest_abs_path: &Path,
+    mut on_progress: Option<&mut dyn FnMut(&str)>,
+) -> ScanResult {
     let default_hash = manifest.default_hash();
     let mut acc = Accum::default();
 
@@ -110,6 +123,7 @@ pub fn scan(
         default_hash,
         ignore,
         manifest_abs_path,
+        &mut on_progress,
         &mut acc,
     );
 
@@ -159,6 +173,7 @@ fn update_recursive(
     default_hash: HashType,
     ignore: &IgnoreSet,
     manifest_abs_path: &Path,
+    on_progress: &mut Option<&mut dyn FnMut(&str)>,
     acc: &mut Accum,
 ) {
     // Enumerate the filesystem directory (NFC-normalized names).
@@ -199,7 +214,7 @@ fn update_recursive(
             // Missing from the filesystem.
             let hash = man_dir.files.get(name).and_then(|mf| mf.file_hash.clone());
             man_dir.files.shift_remove(name);
-            progress(acc, opts, &std_path, "MISSING");
+            progress(acc, opts, &std_path, "MISSING", on_progress);
             acc.missing_entries.push(MissingEntry {
                 path: std_path,
                 hash,
@@ -210,14 +225,14 @@ fn update_recursive(
         acc.result.files_checked += 1;
 
         let Some((fs_len, fs_mtime)) = read_len_mtime(fs_path) else {
-            progress(acc, opts, &std_path, "ERROR");
+            progress(acc, opts, &std_path, "ERROR", on_progress);
             acc.result.error_files.push(std_path);
             continue;
         };
 
         if ignore.is_ignored(&std_path) {
             man_dir.files.shift_remove(name);
-            progress(acc, opts, &std_path, "NEWLY IGNORED");
+            progress(acc, opts, &std_path, "NEWLY IGNORED", on_progress);
             acc.result.newly_ignored_files.push(std_path);
             continue;
         }
@@ -229,7 +244,7 @@ fn update_recursive(
 
         if fs_len != man_len && !opts.update && !opts.always_check_hash {
             // Length differs but we are not updating: report without hashing.
-            progress(acc, opts, &std_path, "DIFFERENT");
+            progress(acc, opts, &std_path, "DIFFERENT", on_progress);
             acc.result.changed_files.push(std_path);
             continue;
         }
@@ -241,7 +256,7 @@ fn update_recursive(
             || fs_len != man_len;
 
         if !must_hash {
-            progress(acc, opts, &std_path, "SKIPPED");
+            progress(acc, opts, &std_path, "SKIPPED", on_progress);
             continue;
         }
 
@@ -251,20 +266,24 @@ fn update_recursive(
             .unwrap_or(default_hash);
         let mut effective_mtime = fs_mtime;
 
-        match FileHash::compute(fs_path, hash_type) {
+        let mut on_hash_progress = |percent: u8| {
+            emit_hash_progress(opts, &std_path, percent, on_progress);
+        };
+
+        match FileHash::compute_with_progress(fs_path, hash_type, Some(&mut on_hash_progress)) {
             Ok(check_hash) => {
                 match &man_hash {
                     None => {
-                        progress(acc, opts, &std_path, "NULL HASH IN MANIFEST");
+                        finish_hash_progress(acc, opts, &std_path, "DIFFERENT", on_progress);
                         acc.result.changed_files.push(std_path.clone());
                     }
                     Some(existing) if check_hash != *existing => {
-                        progress(acc, opts, &std_path, "DIFFERENT");
+                        finish_hash_progress(acc, opts, &std_path, "DIFFERENT", on_progress);
                         acc.result.changed_files.push(std_path.clone());
                     }
                     Some(_) => {
+                        finish_hash_progress(acc, opts, &std_path, "VALIDATED", on_progress);
                         if !compare_fs_date(fs_mtime, man_mtime) {
-                            progress(acc, opts, &std_path, "LAST MODIFIED DATE");
                             acc.result.last_modified_files.push(std_path.clone());
                             if opts.back_date && set_file_mtime(fs_path, man_mtime).is_ok() {
                                 effective_mtime = man_mtime;
@@ -291,7 +310,7 @@ fn update_recursive(
                 mf.file_length = fs_len;
             }
             Err(_) => {
-                progress(acc, opts, &std_path, "ERROR");
+                finish_hash_progress(acc, opts, &std_path, "ERROR", on_progress);
                 acc.result.error_files.push(std_path);
                 let mf = man_dir.files.get_mut(name).unwrap();
                 mf.file_hash = None;
@@ -316,6 +335,7 @@ fn update_recursive(
                 default_hash,
                 ignore,
                 manifest_abs_path,
+                on_progress,
                 acc,
             );
         }
@@ -336,7 +356,7 @@ fn update_recursive(
         let std_path = standard_file_path(dir_prefix, name);
 
         if ignore.is_ignored(&std_path) {
-            progress(acc, opts, &std_path, "IGNORED");
+            progress(acc, opts, &std_path, "IGNORED", on_progress);
             acc.result.ignored_files.push(std_path);
             if fs_path != manifest_abs_path {
                 acc.result.ignored_files_for_groom.push(fs_path);
@@ -347,7 +367,7 @@ fn update_recursive(
         acc.result.files_checked += 1;
 
         let Some((fs_len, fs_mtime)) = read_len_mtime(&fs_path) else {
-            progress(acc, opts, &std_path, "ERROR");
+            progress(acc, opts, &std_path, "ERROR", on_progress);
             acc.result.error_files.push(std_path);
             continue;
         };
@@ -356,17 +376,24 @@ fn update_recursive(
         let mut file_hash = None;
         let mut errored = false;
         if check_hash {
-            match FileHash::compute(&fs_path, default_hash) {
+            let mut on_hash_progress = |percent: u8| {
+                emit_hash_progress(opts, &std_path, percent, on_progress);
+            };
+            match FileHash::compute_with_progress(&fs_path, default_hash, Some(&mut on_hash_progress)) {
                 Ok(h) => file_hash = Some(h),
                 Err(_) => errored = true,
             }
         }
 
         if errored {
-            progress(acc, opts, &std_path, "ERROR");
+            finish_hash_progress(acc, opts, &std_path, "ERROR", on_progress);
             acc.result.error_files.push(std_path.clone());
         } else {
-            progress(acc, opts, &std_path, "NEW");
+            if check_hash {
+                finish_hash_progress(acc, opts, &std_path, "NEW", on_progress);
+            } else {
+                progress(acc, opts, &std_path, "NEW", on_progress);
+            }
             acc.new_entries.push(NewEntry {
                 path: std_path.clone(),
                 hash: file_hash.clone(),
@@ -407,6 +434,7 @@ fn update_recursive(
             default_hash,
             ignore,
             manifest_abs_path,
+            on_progress,
             acc,
         );
         if !new_sub.is_empty() {
@@ -505,8 +533,50 @@ fn track_duplicates(manifest: &Manifest, result: &mut ScanResult) {
     }
 }
 
-fn progress(acc: &mut Accum, opts: &ScanOptions, std_path: &str, tag: &str) {
+fn progress(
+    acc: &mut Accum,
+    opts: &ScanOptions,
+    std_path: &str,
+    tag: &str,
+    on_progress: &mut Option<&mut dyn FnMut(&str)>,
+) {
     if opts.show_progress {
+        let line = format!("{std_path} [{tag}]");
+        if let Some(cb) = on_progress.as_deref_mut() {
+            cb(&line);
+        }
+        acc.result.progress_log.push(line);
+    }
+}
+
+fn emit_hash_progress(
+    opts: &ScanOptions,
+    std_path: &str,
+    percent: u8,
+    on_progress: &mut Option<&mut dyn FnMut(&str)>,
+) {
+    if !opts.show_progress {
+        return;
+    }
+
+    if let Some(cb) = on_progress.as_deref_mut() {
+        let line = format!("\r{std_path} [HASHING {percent}%]      ");
+        cb(&line);
+    }
+}
+
+fn finish_hash_progress(
+    acc: &mut Accum,
+    opts: &ScanOptions,
+    std_path: &str,
+    tag: &str,
+    on_progress: &mut Option<&mut dyn FnMut(&str)>,
+) {
+    if opts.show_progress {
+        if let Some(cb) = on_progress.as_deref_mut() {
+            let dynamic = format!("\r{std_path} [{tag}]      \n");
+            cb(&dynamic);
+        }
         acc.result.progress_log.push(format!("{std_path} [{tag}]"));
     }
 }

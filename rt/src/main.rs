@@ -13,7 +13,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 
 use repotools_manifest::ignore::IgnoreSet;
-use repotools_manifest::scan::{scan, MovedFileSet, ScanOptions, ScanResult};
+use repotools_manifest::scan::{scan_with_progress, MovedFileSet, ScanOptions, ScanResult};
 use repotools_manifest::{io as manifest_io, HashType, Manifest, DEFAULT_MANIFEST_FILE_NAME};
 
 #[derive(Parser, Debug)]
@@ -316,8 +316,18 @@ fn cmd_scan(
         }
     };
     let opts = scan_options(cli);
-    let result = scan(root, &mut manifest, &opts, &ignore, manifest_abs);
-    report(out, cli, &result);
+    let mut in_dynamic_progress = false;
+    let mut progress = |line: &str| out.progress(line, &mut in_dynamic_progress);
+    let result = scan_with_progress(
+        root,
+        &mut manifest,
+        &opts,
+        &ignore,
+        manifest_abs,
+        Some(&mut progress),
+    );
+    out.finish_dynamic_progress(&mut in_dynamic_progress);
+    report(out, cli, &result, false);
 
     match cli.command {
         Command::Update => {
@@ -354,8 +364,18 @@ fn cmd_validate(
     };
     let mut scanned = original.clone();
     let opts = scan_options(cli);
-    let result = scan(root, &mut scanned, &opts, &ignore, manifest_abs);
-    let different = report(out, cli, &result);
+    let mut in_dynamic_progress = false;
+    let mut progress = |line: &str| out.progress(line, &mut in_dynamic_progress);
+    let result = scan_with_progress(
+        root,
+        &mut scanned,
+        &opts,
+        &ignore,
+        manifest_abs,
+        Some(&mut progress),
+    );
+    out.finish_dynamic_progress(&mut in_dynamic_progress);
+    let different = report(out, cli, &result, false);
 
     if different {
         out.line("Problems found.");
@@ -425,8 +445,8 @@ fn scan_options(cli: &Cli) -> ScanOptions {
 
 /// Prints the scan result and returns whether a significant difference was found
 /// (used to set the validate exit code).
-fn report(out: &Output, cli: &Cli, r: &ScanResult) -> bool {
-    if cli.show_progress {
+fn report(out: &Output, cli: &Cli, r: &ScanResult, emit_buffered_progress: bool) -> bool {
+    if cli.show_progress && emit_buffered_progress {
         for line in &r.progress_log {
             out.line(line);
         }
@@ -628,6 +648,37 @@ impl Output {
     fn line(&self, msg: &str) {
         if !self.silent {
             println!("{msg}");
+        }
+    }
+
+    fn line_flush(&self, msg: &str) {
+        if !self.silent {
+            println!("{msg}");
+            let _ = io::stdout().flush();
+        }
+    }
+
+    fn progress(&self, msg: &str, in_dynamic_progress: &mut bool) {
+        if self.silent {
+            return;
+        }
+        if msg.starts_with('\r') {
+            print!("{msg}");
+            let _ = io::stdout().flush();
+            *in_dynamic_progress = !msg.ends_with('\n');
+            return;
+        }
+        if *in_dynamic_progress {
+            println!();
+            *in_dynamic_progress = false;
+        }
+        self.line_flush(msg);
+    }
+
+    fn finish_dynamic_progress(&self, in_dynamic_progress: &mut bool) {
+        if !self.silent && *in_dynamic_progress {
+            println!();
+            *in_dynamic_progress = false;
         }
     }
 

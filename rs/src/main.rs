@@ -3,6 +3,7 @@
 //! options. Phase 2 supports local↔local repositories; remote and encrypted
 //! repositories are deferred to later phases.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -136,9 +137,11 @@ fn cmd_sync(
     }
 
     let silent = cli.silent;
+    let mut stdout = std::io::stdout();
     let mut log = |msg: String| {
         if !silent {
-            println!("{msg}");
+            let _ = writeln!(stdout, "{msg}");
+            let _ = stdout.flush();
         }
     };
     do_update(&mut source_rep, &mut dest_rep, &opts, &mut log)?;
