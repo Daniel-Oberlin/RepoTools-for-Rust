@@ -20,6 +20,7 @@ walkdir.workspace = true
 unicode-normalization.workspace = true
 indexmap.workspace = true
 thiserror.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

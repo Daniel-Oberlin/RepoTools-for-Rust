@@ -88,6 +88,41 @@ fn validate_detects_rename_with_track_moves() {
 }
 
 #[test]
+fn validate_with_jobs_reports_clean_repo() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "a.txt", "hello world\n");
+    write(dir.path(), "b.txt", "second\n");
+
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path()).arg("update").assert().success();
+
+    rt(dir.path())
+        .args(["validate", "--jobs", "2"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No problems."));
+}
+
+#[test]
+fn validate_with_jobs_detects_rename_with_track_moves() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "a.txt", "movable content\n");
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path()).arg("update").assert().success();
+
+    fs::rename(dir.path().join("a.txt"), dir.path().join("renamed.txt")).unwrap();
+
+    rt(dir.path())
+        .args(["validate", "--jobs", "2", "--track-moves", "--detail"])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("1 files were moved.")
+                .and(predicate::str::contains("./a.txt -> ./renamed.txt")),
+        );
+}
+
+#[test]
 fn status_detects_changed_and_missing() {
     let dir = TempDir::new().unwrap();
     write(dir.path(), "keep.txt", "stable\n");

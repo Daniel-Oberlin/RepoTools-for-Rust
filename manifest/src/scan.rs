@@ -15,6 +15,7 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
+use rayon::prelude::*;
 
 use crate::hash::HashType;
 use crate::ignore::IgnoreSet;
@@ -28,7 +29,7 @@ const FILESYSTEM_DATE_TOLERANCE_MS: i64 = 2000;
 
 /// Behavior flags controlling a scan, mirroring the toggles on the .NET
 /// `RepositoryTool`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ScanOptions {
     /// Bringing the manifest up to date (compute hashes for new/changed files).
     pub update: bool,
@@ -45,6 +46,23 @@ pub struct ScanOptions {
     pub track_duplicates: bool,
     /// Record a per-file progress line in [`ScanResult::progress_log`].
     pub show_progress: bool,
+    /// Number of concurrent hash jobs to use for validation-style scans.
+    pub hash_jobs: usize,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            update: false,
+            always_check_hash: false,
+            make_new_hash: false,
+            back_date: false,
+            track_moves: false,
+            track_duplicates: false,
+            show_progress: false,
+            hash_jobs: 1,
+        }
+    }
 }
 
 /// A set of files that appear to have moved: the old (missing) locations and
@@ -127,6 +145,10 @@ pub fn scan_with_progress(
         &mut acc,
     );
 
+    if opts.hash_jobs > 1 {
+        process_deferred_hashes(manifest, opts, &mut on_progress, &mut acc);
+    }
+
     if opts.track_moves {
         track_moves(&mut acc);
     } else {
@@ -150,6 +172,7 @@ struct Accum {
     result: ScanResult,
     new_entries: Vec<NewEntry>,
     missing_entries: Vec<MissingEntry>,
+    deferred_hashes: Vec<DeferredHashWork>,
 }
 
 struct NewEntry {
@@ -162,6 +185,34 @@ struct NewEntry {
 struct MissingEntry {
     path: String,
     hash: Option<FileHash>,
+}
+
+#[derive(Clone)]
+struct DeferredHashWork {
+    std_path: String,
+    fs_path: PathBuf,
+    compare_hash_type: HashType,
+    store_hash_type: Option<HashType>,
+    kind: DeferredHashKind,
+}
+
+#[derive(Clone)]
+enum DeferredHashKind {
+    Existing {
+        man_hash: Option<FileHash>,
+        fs_len: i64,
+        fs_mtime: DateTime<Utc>,
+        man_mtime: DateTime<Utc>,
+    },
+    New {
+        native: PathBuf,
+    },
+}
+
+struct DeferredHashResult {
+    work: DeferredHashWork,
+    compare_hash: std::io::Result<FileHash>,
+    stored_hash: Option<std::io::Result<FileHash>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -264,6 +315,23 @@ fn update_recursive(
             .as_ref()
             .map(|h| h.hash_type)
             .unwrap_or(default_hash);
+
+        if opts.hash_jobs > 1 {
+            acc.deferred_hashes.push(DeferredHashWork {
+                std_path,
+                fs_path: fs_path.clone(),
+                compare_hash_type: hash_type,
+                store_hash_type: opts.make_new_hash.then_some(default_hash),
+                kind: DeferredHashKind::Existing {
+                    man_hash,
+                    fs_len,
+                    fs_mtime,
+                    man_mtime,
+                },
+            });
+            continue;
+        }
+
         let mut effective_mtime = fs_mtime;
 
         let mut on_hash_progress = |percent: u8| {
@@ -375,30 +443,49 @@ fn update_recursive(
         let check_hash = opts.update || opts.always_check_hash || opts.track_moves;
         let mut file_hash = None;
         let mut errored = false;
+        if opts.hash_jobs > 1 && check_hash {
+            acc.deferred_hashes.push(DeferredHashWork {
+                std_path: std_path.clone(),
+                fs_path: fs_path.clone(),
+                compare_hash_type: default_hash,
+                store_hash_type: None,
+                kind: DeferredHashKind::New {
+                    native: fs_path.clone(),
+                },
+            });
+        }
         if check_hash {
-            let mut on_hash_progress = |percent: u8| {
-                emit_hash_progress(opts, &std_path, percent, on_progress);
-            };
-            match FileHash::compute_with_progress(&fs_path, default_hash, Some(&mut on_hash_progress)) {
-                Ok(h) => file_hash = Some(h),
-                Err(_) => errored = true,
+            if opts.hash_jobs == 1 {
+                let mut on_hash_progress = |percent: u8| {
+                    emit_hash_progress(opts, &std_path, percent, on_progress);
+                };
+                match FileHash::compute_with_progress(
+                    &fs_path,
+                    default_hash,
+                    Some(&mut on_hash_progress),
+                ) {
+                    Ok(h) => file_hash = Some(h),
+                    Err(_) => errored = true,
+                }
             }
         }
 
-        if errored {
-            finish_hash_progress(acc, opts, &std_path, "ERROR", on_progress);
-            acc.result.error_files.push(std_path.clone());
-        } else {
-            if check_hash {
-                finish_hash_progress(acc, opts, &std_path, "NEW", on_progress);
+        if opts.hash_jobs == 1 || !check_hash {
+            if errored {
+                finish_hash_progress(acc, opts, &std_path, "ERROR", on_progress);
+                acc.result.error_files.push(std_path.clone());
             } else {
-                progress(acc, opts, &std_path, "NEW", on_progress);
+                if check_hash {
+                    finish_hash_progress(acc, opts, &std_path, "NEW", on_progress);
+                } else {
+                    progress(acc, opts, &std_path, "NEW", on_progress);
+                }
+                acc.new_entries.push(NewEntry {
+                    path: std_path.clone(),
+                    hash: file_hash.clone(),
+                    native: fs_path.clone(),
+                });
             }
-            acc.new_entries.push(NewEntry {
-                path: std_path.clone(),
-                hash: file_hash.clone(),
-                native: fs_path.clone(),
-            });
         }
 
         // The entry is added to the manifest regardless (matching .NET); on a
@@ -503,6 +590,180 @@ fn track_moves(acc: &mut Accum) {
     acc.result.new_files_for_groom = new_groom;
 }
 
+fn process_deferred_hashes(
+    manifest: &mut Manifest,
+    opts: &ScanOptions,
+    on_progress: &mut Option<&mut dyn FnMut(&str)>,
+    acc: &mut Accum,
+) {
+    let work = std::mem::take(&mut acc.deferred_hashes);
+    if work.is_empty() {
+        return;
+    }
+
+    let results = rayon::ThreadPoolBuilder::new()
+        .num_threads(opts.hash_jobs)
+        .build()
+        .expect("failed to build rayon pool")
+        .install(|| work.into_par_iter().map(run_deferred_hash_work).collect::<Vec<_>>());
+
+    for result in results {
+        apply_deferred_hash_result(manifest, opts, on_progress, acc, result);
+    }
+}
+
+fn run_deferred_hash_work(work: DeferredHashWork) -> DeferredHashResult {
+    let compare_hash = FileHash::compute(&work.fs_path, work.compare_hash_type);
+    let stored_hash = match (work.store_hash_type, &compare_hash) {
+        (Some(store_type), Ok(check_hash)) if store_type == check_hash.hash_type => {
+            Some(Ok(check_hash.clone()))
+        }
+        (Some(store_type), Ok(_)) => Some(FileHash::compute(&work.fs_path, store_type)),
+        (Some(_), Err(_)) => None,
+        (None, _) => None,
+    };
+
+    DeferredHashResult {
+        work,
+        compare_hash,
+        stored_hash,
+    }
+}
+
+fn apply_deferred_hash_result(
+    manifest: &mut Manifest,
+    opts: &ScanOptions,
+    on_progress: &mut Option<&mut dyn FnMut(&str)>,
+    acc: &mut Accum,
+    result: DeferredHashResult,
+) {
+    match result.work.kind {
+        DeferredHashKind::Existing {
+            man_hash,
+            fs_len,
+            fs_mtime,
+            man_mtime,
+        } => {
+            let mf = manifest_file_mut(&mut manifest.root_directory, &result.work.std_path)
+                .expect("existing manifest file missing during deferred hash apply");
+            match result.compare_hash {
+                Ok(check_hash) => {
+                    let mut effective_mtime = fs_mtime;
+                    match &man_hash {
+                        None => {
+                            finish_hash_progress(
+                                acc,
+                                opts,
+                                &result.work.std_path,
+                                "DIFFERENT",
+                                on_progress,
+                            );
+                            acc.result.changed_files.push(result.work.std_path.clone());
+                        }
+                        Some(existing) if check_hash != *existing => {
+                            finish_hash_progress(
+                                acc,
+                                opts,
+                                &result.work.std_path,
+                                "DIFFERENT",
+                                on_progress,
+                            );
+                            acc.result.changed_files.push(result.work.std_path.clone());
+                        }
+                        Some(_) => {
+                            finish_hash_progress(
+                                acc,
+                                opts,
+                                &result.work.std_path,
+                                "VALIDATED",
+                                on_progress,
+                            );
+                            if !compare_fs_date(fs_mtime, man_mtime) {
+                                acc.result
+                                    .last_modified_files
+                                    .push(result.work.std_path.clone());
+                                if opts.back_date
+                                    && set_file_mtime(&result.work.fs_path, man_mtime).is_ok()
+                                {
+                                    effective_mtime = man_mtime;
+                                }
+                            }
+                        }
+                    }
+
+                    let new_hash = if opts.make_new_hash {
+                        match result.stored_hash {
+                            Some(Ok(h)) => Some(h),
+                            Some(Err(_)) => {
+                                acc.result.error_files.push(result.work.std_path.clone());
+                                None
+                            }
+                            None => Some(check_hash.clone()),
+                        }
+                    } else {
+                        Some(check_hash)
+                    };
+
+                    mf.file_hash = new_hash;
+                    mf.last_modified_utc = effective_mtime;
+                    mf.file_length = fs_len;
+                }
+                Err(_) => {
+                    finish_hash_progress(
+                        acc,
+                        opts,
+                        &result.work.std_path,
+                        "ERROR",
+                        on_progress,
+                    );
+                    acc.result.error_files.push(result.work.std_path.clone());
+                    mf.file_hash = None;
+                    mf.last_modified_utc = fs_mtime;
+                    mf.file_length = fs_len;
+                }
+            }
+        }
+        DeferredHashKind::New { native } => {
+            let mf = manifest_file_mut(&mut manifest.root_directory, &result.work.std_path)
+                .expect("new manifest file missing during deferred hash apply");
+            match result.compare_hash {
+                Ok(check_hash) => {
+                    finish_hash_progress(acc, opts, &result.work.std_path, "NEW", on_progress);
+                    mf.file_hash = Some(check_hash.clone());
+                    acc.new_entries.push(NewEntry {
+                        path: result.work.std_path.clone(),
+                        hash: Some(check_hash),
+                        native,
+                    });
+                }
+                Err(_) => {
+                    finish_hash_progress(acc, opts, &result.work.std_path, "ERROR", on_progress);
+                    acc.result.error_files.push(result.work.std_path.clone());
+                    mf.file_hash = None;
+                }
+            }
+        }
+    }
+}
+
+fn manifest_file_mut<'a>(
+    dir: &'a mut ManifestDirectoryInfo,
+    std_path: &str,
+) -> Option<&'a mut ManifestFileInfo> {
+    let path = std_path.strip_prefix("./")?;
+    let mut parts = path.split('/').peekable();
+    let mut current = dir;
+
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            return current.files.get_mut(part);
+        }
+        current = current.subdirectories.get_mut(part)?;
+    }
+
+    None
+}
+
 fn track_duplicates(manifest: &Manifest, result: &mut ScanResult) {
     fn rec(
         dir: &ManifestDirectoryInfo,
@@ -555,7 +816,7 @@ fn emit_hash_progress(
     percent: u8,
     on_progress: &mut Option<&mut dyn FnMut(&str)>,
 ) {
-    if !opts.show_progress {
+    if !opts.show_progress || opts.hash_jobs > 1 {
         return;
     }
 
@@ -574,8 +835,12 @@ fn finish_hash_progress(
 ) {
     if opts.show_progress {
         if let Some(cb) = on_progress.as_deref_mut() {
-            let dynamic = format!("\r{std_path} [{tag}]      \n");
-            cb(&dynamic);
+            if opts.hash_jobs > 1 {
+                cb(&format!("{std_path} [{tag}]"));
+            } else {
+                let dynamic = format!("\r{std_path} [{tag}]      \n");
+                cb(&dynamic);
+            }
         }
         acc.result.progress_log.push(format!("{std_path} [{tag}]"));
     }

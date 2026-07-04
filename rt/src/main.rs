@@ -86,6 +86,9 @@ struct Cli {
     /// Recompute all hashes during the scan (always check hash).
     #[arg(long, global = true)]
     re_hash: bool,
+    /// Number of concurrent hash jobs to use during validate or re-hash.
+    #[arg(long, global = true, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(usize))]
+    jobs: usize,
     /// Path to the manifest file (defaults to ./.repositoryManifest).
     #[arg(long, global = true, value_name = "PATH")]
     manifest_file: Option<PathBuf>,
@@ -440,6 +443,11 @@ fn scan_options(cli: &Cli) -> ScanOptions {
         track_moves: cli.track_moves,
         track_duplicates: cli.track_duplicates,
         show_progress: cli.show_progress,
+        hash_jobs: if cli.command == Command::Validate || cli.re_hash {
+            cli.jobs.max(1)
+        } else {
+            1
+        },
     }
 }
 
