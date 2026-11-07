@@ -8,10 +8,12 @@ pub mod io;
 pub mod model;
 pub mod paths;
 pub mod scan;
+pub mod scope;
 pub mod serde_fmt;
 
 pub use hash::HashType;
 pub use model::{FileHash, Manifest, ManifestDirectoryInfo, ManifestFileInfo};
+pub use scope::ScanScope;
 
 /// The default manifest file name, located in the repository's root directory.
 pub const DEFAULT_MANIFEST_FILE_NAME: &str = ".repositoryManifest";

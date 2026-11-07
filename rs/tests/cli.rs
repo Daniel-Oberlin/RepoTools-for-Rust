@@ -248,3 +248,105 @@ fn time_reports_duration() {
         .success()
         .stdout(predicate::str::contains("Duration:"));
 }
+
+// --- --json -------------------------------------------------------------------
+
+fn rs_json(args: &[&str], src: &Path, dst: &Path) -> (i32, serde_json::Value) {
+    let out = rs()
+        .args(args)
+        .arg(src)
+        .arg(dst)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "expected one JSON line: {stdout}"
+    );
+    (
+        out.status.code().unwrap(),
+        serde_json::from_str(stdout.trim()).unwrap(),
+    )
+}
+
+#[test]
+fn json_diff_and_preview_then_update() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    build_repo(src.path(), &[("a.txt", "A\n"), ("sub/b.txt", "B\n")]);
+    rs().arg("seed")
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+
+    let (code, d) = rs_json(&["diff"], src.path(), dst.path());
+    assert_eq!(code, 1);
+    assert_eq!(d["ok"], true);
+    assert_eq!(d["different"], true);
+    assert_eq!(d["source_only"].as_array().unwrap().len(), 2);
+    assert!(d["metadata_differences"].as_array().unwrap().is_empty());
+
+    // A preview lists the actions and changes nothing.
+    let (code, p) = rs_json(&["update", "--preview"], src.path(), dst.path());
+    assert_eq!(code, 0);
+    assert_eq!(p["preview"], true);
+    let actions = p["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 2);
+    assert!(actions
+        .iter()
+        .all(|a| a["action"] == "add" && a["side"] == "dest"));
+    assert!(!dst.path().join("a.txt").exists());
+
+    let (code, u) = rs_json(&["update"], src.path(), dst.path());
+    assert_eq!(code, 0);
+    assert_eq!(u["preview"], false);
+    assert!(dst.path().join("sub/b.txt").exists());
+
+    let (code, d) = rs_json(&["diff"], src.path(), dst.path());
+    assert_eq!(code, 0);
+    assert_eq!(d["different"], false);
+}
+
+#[test]
+fn json_move_actions() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    build_repo(src.path(), &[("old/a.txt", "A\n")]);
+    rs().arg("seed")
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+    rs().arg("update")
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+
+    fs::create_dir_all(src.path().join("new")).unwrap();
+    fs::rename(src.path().join("old/a.txt"), src.path().join("new/a.txt")).unwrap();
+    rescan(src.path());
+
+    let (_, p) = rs_json(&["update", "--preview"], src.path(), dst.path());
+    let actions = p["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(actions[0]["action"], "move");
+    assert_eq!(actions[0]["side"], "dest");
+    assert_eq!(actions[0]["from"], "./old/a.txt");
+    assert_eq!(actions[0]["to"], "./new/a.txt");
+}
+
+#[test]
+fn json_guid_mismatch_is_an_error_object() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    build_repo(src.path(), &[("a.txt", "A\n")]);
+    build_repo(dst.path(), &[("a.txt", "A\n")]); // a different GUID
+    let (code, o) = rs_json(&["update"], src.path(), dst.path());
+    assert_eq!(code, 1);
+    assert_eq!(o["ok"], false);
+    assert!(o["error"].as_str().unwrap().contains("GUIDs"));
+}

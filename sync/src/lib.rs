@@ -8,6 +8,6 @@ pub mod local;
 pub mod proxy;
 
 pub use diff::{compare_manifests, MovedFileSet, SyncDiff};
-pub use engine::{do_update, SyncOptions};
+pub use engine::{do_update, do_update_events, Side, SyncEvent, SyncOptions};
 pub use local::LocalRepositoryProxy;
 pub use proxy::RepositoryProxy;

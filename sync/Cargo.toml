@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 repotools_manifest = { path = "../manifest" }
 chrono.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

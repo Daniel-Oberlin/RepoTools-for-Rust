@@ -581,3 +581,237 @@ fn confirm_update_can_decline_the_write() {
         .success();
     assert_eq!(manifest(dir.path()).name.as_deref(), Some("Renamed"));
 }
+
+// --- --json and --path --------------------------------------------------------
+
+/// Runs rt with --json and parses each stdout line as a JSON object.
+fn rt_json(dir: &Path, args: &[&str]) -> (i32, Vec<serde_json::Value>) {
+    let out = rt(dir).args(args).arg("--json").output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let objs = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+        .collect();
+    (out.status.code().unwrap(), objs)
+}
+
+fn strs(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn json_status_reports_categories() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "keep.txt", "keep\n");
+    write(dir.path(), "gone.txt", "gone\n");
+    write(dir.path(), "edit.txt", "before\n");
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path()).arg("update").assert().success();
+
+    fs::remove_file(dir.path().join("gone.txt")).unwrap();
+    write(dir.path(), "edit.txt", "after, and longer\n");
+    write(dir.path(), "sub/new.txt", "new\n");
+
+    let (code, objs) = rt_json(dir.path(), &["status"]);
+    assert_eq!(code, 0);
+    assert_eq!(objs.len(), 1);
+    let o = &objs[0];
+    assert_eq!(o["ok"], true);
+    assert_eq!(o["command"], "status");
+    assert_eq!(o["different"], true);
+    assert!(o["scope"].is_null());
+    assert_eq!(strs(&o["missing"]), vec!["./gone.txt"]);
+    assert_eq!(strs(&o["changed"]), vec!["./edit.txt"]);
+    assert_eq!(strs(&o["new"]), vec!["./sub/new.txt"]);
+    assert_eq!(o["files_checked"], 3);
+    assert!(o["root"].as_str().unwrap().len() > 1);
+}
+
+#[test]
+fn json_update_reports_manifest_written_and_moves() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "a/one.txt", "one\n");
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path()).arg("update").assert().success();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    fs::rename(dir.path().join("a/one.txt"), dir.path().join("b/one.txt")).unwrap();
+
+    let (code, objs) = rt_json(dir.path(), &["update", "--track-moves"]);
+    assert_eq!(code, 0);
+    let o = &objs[0];
+    assert_eq!(o["manifest_written"], true);
+    let moved = o["moved"].as_array().unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(strs(&moved[0]["old_paths"]), vec!["./a/one.txt"]);
+    assert_eq!(strs(&moved[0]["new_paths"]), vec!["./b/one.txt"]);
+    assert_eq!(moved[0]["hash_type"], "MD5");
+    assert_eq!(moved[0]["hash"].as_str().unwrap().len(), 32);
+    assert!(manifest(dir.path()).get_file("./b/one.txt").is_some());
+}
+
+#[test]
+fn json_errors_are_json() {
+    let dir = TempDir::new().unwrap(); // no manifest
+    let (code, objs) = rt_json(dir.path(), &["status"]);
+    assert_ne!(code, 0);
+    assert_eq!(objs[0]["ok"], false);
+    assert!(objs[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("Could not read manifest"));
+}
+
+#[test]
+fn json_info() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "a.txt", "a\n");
+    rt(dir.path())
+        .args(["create", "--name", "Repo"])
+        .assert()
+        .success();
+    rt(dir.path()).arg("update").assert().success();
+    let (code, objs) = rt_json(dir.path(), &["info"]);
+    assert_eq!(code, 0);
+    let o = &objs[0];
+    assert_eq!(o["name"], "Repo");
+    assert_eq!(o["file_count"], 1);
+    assert_eq!(o["default_hash_method"], "MD5");
+    assert_eq!(o["guid"], manifest(dir.path()).guid.to_string());
+}
+
+/// With --json, prompts are answered "no": groom deletes nothing without
+/// --force, and says so.
+#[test]
+fn json_groom_needs_force() {
+    let dir = TempDir::new().unwrap();
+    rt(dir.path()).arg("create").assert().success();
+    write(dir.path(), "stray.txt", "x\n");
+
+    let (_, objs) = rt_json(dir.path(), &["groom"]);
+    assert_eq!(objs[0]["declined"], true);
+    assert!(objs[0]["deleted"].as_array().unwrap().is_empty());
+    assert!(dir.path().join("stray.txt").exists());
+
+    let (_, objs) = rt_json(dir.path(), &["groom", "--force"]);
+    assert_eq!(objs[0]["declined"], false);
+    assert_eq!(objs[0]["deleted"].as_array().unwrap().len(), 1);
+    assert!(!dir.path().join("stray.txt").exists());
+}
+
+/// Progress goes to stderr with --json, so stdout stays parseable.
+#[test]
+fn json_progress_goes_to_stderr() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "a.txt", "a\n");
+    rt(dir.path()).arg("create").assert().success();
+    let out = rt(dir.path())
+        .args(["update", "--json", "--show-progress", "--time"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap();
+    assert!(stderr.contains("./a.txt"));
+    assert!(stderr.contains("Duration:"));
+}
+
+/// --recursive with --json writes one object per repository.
+#[test]
+fn json_recursive_one_line_per_repository() {
+    let dir = TempDir::new().unwrap();
+    for sub in ["r1", "r2"] {
+        let d = dir.path().join(sub);
+        write(&d, "f.txt", sub);
+        rt(&d).arg("create").assert().success();
+        rt(&d).arg("update").assert().success();
+    }
+    let (code, objs) = rt_json(dir.path(), &["status", "--recursive"]);
+    assert_eq!(code, 0);
+    assert_eq!(objs.len(), 2);
+    assert!(objs
+        .iter()
+        .all(|o| o["ok"] == true && o["different"] == false));
+}
+
+#[test]
+fn path_limits_update_to_one_subtree() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "Jazz/Miles/a.flac", "a\n");
+    write(dir.path(), "Pop/Yes/c.flac", "c\n");
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path()).arg("update").assert().success();
+    let update_date = manifest(dir.path()).last_update_date_utc;
+
+    write(dir.path(), "Jazz/Miles/b.flac", "b\n");
+    write(dir.path(), "Pop/Yes/d.flac", "d\n");
+
+    let (code, objs) = rt_json(dir.path(), &["update", "--path", "Jazz/Miles"]);
+    assert_eq!(code, 0);
+    let o = &objs[0];
+    assert_eq!(strs(&o["new"]), vec!["./Jazz/Miles/b.flac"]);
+    assert_eq!(strs(&o["scope"]["dirs"]), vec!["./Jazz/Miles/"]);
+    assert_eq!(o["manifest_written"], true);
+
+    let m = manifest(dir.path());
+    assert!(m.get_file("./Jazz/Miles/b.flac").is_some());
+    assert!(m.get_file("./Pop/Yes/d.flac").is_none());
+    assert_eq!(m.last_update_date_utc, update_date);
+
+    // The rest is still pending for a full status.
+    rt(dir.path())
+        .arg("status")
+        .assert()
+        .stdout(predicate::str::contains("1 files are new."));
+}
+
+#[test]
+fn path_validate_does_not_touch_validation_date() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "Jazz/a.flac", "a\n");
+    rt(dir.path()).arg("create").assert().success();
+    rt(dir.path()).arg("update").assert().success();
+    let before = manifest(dir.path()).last_validate_date_utc;
+
+    let (code, objs) = rt_json(dir.path(), &["validate", "--path", "Jazz"]);
+    assert_eq!(code, 0);
+    assert_eq!(objs[0]["problems"], false);
+    assert_eq!(objs[0]["validation_date_written"], false);
+    assert_eq!(manifest(dir.path()).last_validate_date_utc, before);
+
+    let (_, objs) = rt_json(dir.path(), &["validate"]);
+    assert_eq!(objs[0]["validation_date_written"], true);
+    assert!(manifest(dir.path()).last_validate_date_utc > before);
+}
+
+#[test]
+fn path_errors() {
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "a.txt", "a\n");
+    rt(dir.path()).arg("create").assert().success();
+
+    rt(dir.path())
+        .args(["status", "--path", "nope"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("not in the repository"));
+    rt(dir.path())
+        .args(["status", "--path", "../elsewhere"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("outside the repository"));
+    rt(dir.path())
+        .args(["info", "--path", "a.txt"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("--path only applies"));
+    rt(dir.path())
+        .args(["status", "--recursive", "--path", "a.txt"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("--recursive"));
+}

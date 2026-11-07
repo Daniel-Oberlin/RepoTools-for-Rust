@@ -11,10 +11,13 @@ use std::time::Instant;
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use serde_json::{json, Map, Value};
 
 use repotools_manifest::ignore::IgnoreSet;
 use repotools_manifest::scan::{scan_with_progress, MovedFileSet, ScanOptions, ScanResult};
-use repotools_manifest::{io as manifest_io, HashType, Manifest, DEFAULT_MANIFEST_FILE_NAME};
+use repotools_manifest::{
+    io as manifest_io, HashType, Manifest, ScanScope, DEFAULT_MANIFEST_FILE_NAME,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -104,6 +107,17 @@ struct Cli {
     /// After an update, ask before writing the updated manifest.
     #[arg(long, global = true)]
     confirm_update: bool,
+    /// Write the result as one JSON object per repository (one per line)
+    /// instead of text. Progress (--show-progress) and --time go to stderr.
+    /// Prompts are answered "no", so pass --force where a command would ask.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Limit status, update, validate or groom to this directory or file,
+    /// relative to the repository root (repeatable). Entries outside it are
+    /// left untouched and not reported. A scoped update or validate does not
+    /// change the manifest's last-update or last-validation date.
+    #[arg(long, global = true, value_name = "PATH")]
+    path: Vec<String>,
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq, Clone, Copy)]
@@ -126,18 +140,49 @@ enum Command {
     Clear,
 }
 
+impl Command {
+    fn name(self) -> &'static str {
+        match self {
+            Command::Create => "create",
+            Command::Status => "status",
+            Command::Validate => "validate",
+            Command::Update => "update",
+            Command::Edit => "edit",
+            Command::Groom => "groom",
+            Command::Info => "info",
+            Command::Clear => "clear",
+        }
+    }
+
+    fn scans(self) -> bool {
+        matches!(
+            self,
+            Command::Status | Command::Update | Command::Validate | Command::Groom
+        )
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let out = Output {
         silent: cli.silent,
         detail: cli.detail,
+        json: cli.json,
+        command: cli.command,
     };
     let start = Instant::now();
 
     let code = run(&cli, &out);
 
     if cli.time {
-        out.line(&format!("Duration: {:.3}s", start.elapsed().as_secs_f64()));
+        let msg = format!("Duration: {:.3}s", start.elapsed().as_secs_f64());
+        if cli.json {
+            if !cli.silent {
+                eprintln!("{msg}");
+            }
+        } else {
+            out.line(&msg);
+        }
     }
     if code == 0 {
         ExitCode::SUCCESS
@@ -147,10 +192,24 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli, out: &Output) -> i32 {
+    if !cli.path.is_empty() {
+        if !cli.command.scans() {
+            out.error(
+                None,
+                "--path only applies to status, update, validate and groom.",
+            );
+            return 1;
+        }
+        if cli.recursive {
+            out.error(None, "--path can't be combined with --recursive.");
+            return 1;
+        }
+    }
+
     let manifest_paths = match collect_manifest_paths(cli) {
         Ok(p) => p,
         Err(e) => {
-            out.line(&format!("Error: {e}"));
+            out.error(None, &format!("Error: {e}"));
             return 1;
         }
     };
@@ -187,73 +246,150 @@ fn process_one(cli: &Cli, out: &Output, manifest_path: &Path) -> i32 {
     let root = match std::fs::canonicalize(&root) {
         Ok(r) => r,
         Err(e) => {
-            out.line(&format!("Could not access directory: {e}"));
+            out.error(Some(&root), &format!("Could not access directory: {e}"));
             return 1;
         }
     };
     let manifest_abs = root.join(DEFAULT_MANIFEST_FILE_NAME);
+    let ctx = Ctx {
+        root: &root,
+        manifest_path,
+        manifest_abs: &manifest_abs,
+    };
 
     match cli.command {
-        Command::Create => cmd_create(cli, out, manifest_path),
-        Command::Info => cmd_info(out, manifest_path),
-        Command::Clear => cmd_clear(cli, out, manifest_path),
-        Command::Edit => cmd_edit(cli, out, manifest_path),
-        Command::Validate => cmd_validate(cli, out, manifest_path, &root, &manifest_abs),
-        Command::Status | Command::Update | Command::Groom => {
-            cmd_scan(cli, out, manifest_path, &root, &manifest_abs)
-        }
+        Command::Create => cmd_create(cli, out, &ctx),
+        Command::Info => cmd_info(out, &ctx),
+        Command::Clear => cmd_clear(cli, out, &ctx),
+        Command::Edit => cmd_edit(cli, out, &ctx),
+        Command::Validate => cmd_validate(cli, out, &ctx),
+        Command::Status | Command::Update | Command::Groom => cmd_scan(cli, out, &ctx),
     }
 }
 
-fn cmd_create(cli: &Cli, out: &Output, manifest_path: &Path) -> i32 {
-    if !cli.force && manifest_path.exists() && !confirm(out, "Replace existing manifest file? ") {
-        return 0;
+/// Where the repository being processed lives.
+struct Ctx<'a> {
+    /// Canonical repository root.
+    root: &'a Path,
+    /// The manifest file as given (or found).
+    manifest_path: &'a Path,
+    /// Absolute path of the manifest inside the root (never groomed).
+    manifest_abs: &'a Path,
+}
+
+/// The base of every JSON result: which command ran on which repository.
+fn json_base(out: &Output, ctx: &Ctx) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("ok".into(), json!(true));
+    m.insert("command".into(), json!(out.command.name()));
+    m.insert("root".into(), json!(ctx.root.display().to_string()));
+    m.insert(
+        "manifest".into(),
+        json!(ctx.manifest_path.display().to_string()),
+    );
+    m
+}
+
+/// Emits the JSON result for commands that only (maybe) write the manifest.
+fn finish_write(out: &Output, ctx: &Ctx, outcome: WriteOutcome) -> i32 {
+    if out.json {
+        if outcome == WriteOutcome::Failed {
+            return 1; // already reported by write_manifest
+        }
+        let mut m = json_base(out, ctx);
+        m.insert(
+            "manifest_written".into(),
+            json!(outcome == WriteOutcome::Written),
+        );
+        out.emit(m);
+    }
+    outcome.code()
+}
+
+fn cmd_create(cli: &Cli, out: &Output, ctx: &Ctx) -> i32 {
+    if !cli.force && ctx.manifest_path.exists() && !confirm(out, "Replace existing manifest file? ")
+    {
+        return finish_write(out, ctx, WriteOutcome::Declined);
     }
     let mut manifest = Manifest::new_clean();
     if let Err(e) = apply_edits(cli, &mut manifest) {
-        out.line(&e);
+        out.error(Some(ctx.root), &e);
         return 1;
     }
-    write_manifest(cli, out, manifest_path, &manifest)
+    let outcome = write_manifest(cli, out, ctx, &manifest);
+    finish_write(out, ctx, outcome)
 }
 
-fn cmd_edit(cli: &Cli, out: &Output, manifest_path: &Path) -> i32 {
-    let mut manifest = match read_manifest(out, manifest_path) {
+fn cmd_edit(cli: &Cli, out: &Output, ctx: &Ctx) -> i32 {
+    let mut manifest = match read_manifest(out, ctx) {
         Some(m) => m,
         None => return 1,
     };
     if let Err(e) = apply_edits(cli, &mut manifest) {
-        out.line(&e);
+        out.error(Some(ctx.root), &e);
         return 1;
     }
-    write_manifest(cli, out, manifest_path, &manifest)
+    let outcome = write_manifest(cli, out, ctx, &manifest);
+    finish_write(out, ctx, outcome)
 }
 
-fn cmd_clear(cli: &Cli, out: &Output, manifest_path: &Path) -> i32 {
-    let mut manifest = match read_manifest(out, manifest_path) {
+fn cmd_clear(cli: &Cli, out: &Output, ctx: &Ctx) -> i32 {
+    let mut manifest = match read_manifest(out, ctx) {
         Some(m) => m,
         None => return 1,
     };
     if !cli.force {
         let prompt = format!("Clear {} files from the manifest? ", manifest.count_files());
         if !confirm(out, &prompt) {
-            return 0;
+            return finish_write(out, ctx, WriteOutcome::Declined);
         }
     }
     manifest.root_directory.files.clear();
     manifest.root_directory.subdirectories.clear();
     if let Err(e) = apply_edits(cli, &mut manifest) {
-        out.line(&e);
+        out.error(Some(ctx.root), &e);
         return 1;
     }
-    write_manifest(cli, out, manifest_path, &manifest)
+    let outcome = write_manifest(cli, out, ctx, &manifest);
+    finish_write(out, ctx, outcome)
 }
 
-fn cmd_info(out: &Output, manifest_path: &Path) -> i32 {
-    let manifest = match read_manifest(out, manifest_path) {
+fn cmd_info(out: &Output, ctx: &Ctx) -> i32 {
+    let manifest = match read_manifest(out, ctx) {
         Some(m) => m,
         None => return 1,
     };
+    if out.json {
+        let mut m = json_base(out, ctx);
+        m.insert("name".into(), json!(manifest.name));
+        m.insert("guid".into(), json!(manifest.guid.to_string()));
+        m.insert(
+            "default_hash_method".into(),
+            json!(manifest.default_hash_method.map(|h| h.as_str())),
+        );
+        m.insert(
+            "inception_date_utc".into(),
+            json!(manifest.inception_date_utc.to_rfc3339()),
+        );
+        m.insert(
+            "last_update_date_utc".into(),
+            json!(manifest.last_update_date_utc.to_rfc3339()),
+        );
+        m.insert(
+            "manifest_info_last_modified_utc".into(),
+            json!(manifest.manifest_info_last_modified_utc.to_rfc3339()),
+        );
+        m.insert(
+            "last_validate_date_utc".into(),
+            json!(manifest.last_validate_date_utc.to_rfc3339()),
+        );
+        m.insert("file_count".into(), json!(manifest.count_files()));
+        m.insert("byte_count".into(), json!(manifest.count_bytes()));
+        m.insert("ignore_list".into(), json!(manifest.ignore_list));
+        m.insert("description".into(), json!(manifest.description));
+        out.emit(m);
+        return 0;
+    }
     if let Some(name) = &manifest.name {
         out.line(&format!("Name:                          {name}"));
     }
@@ -300,81 +436,77 @@ fn cmd_info(out: &Output, manifest_path: &Path) -> i32 {
 }
 
 /// Implements `status`, `update`, and `groom`, which all scan the repository.
-fn cmd_scan(
-    cli: &Cli,
-    out: &Output,
-    manifest_path: &Path,
-    root: &Path,
-    manifest_abs: &Path,
-) -> i32 {
-    let mut manifest = match read_manifest(out, manifest_path) {
+fn cmd_scan(cli: &Cli, out: &Output, ctx: &Ctx) -> i32 {
+    let mut manifest = match read_manifest(out, ctx) {
         Some(m) => m,
         None => return 1,
     };
-    let ignore = match IgnoreSet::compile(&manifest.ignore_list) {
-        Ok(i) => i,
-        Err(e) => {
-            out.line(&format!("Invalid ignore pattern: {e}"));
-            return 1;
-        }
+    let Some((ignore, opts)) = prepare_scan(cli, out, ctx, &manifest) else {
+        return 1;
     };
-    let opts = scan_options(cli);
     let mut in_dynamic_progress = false;
     let mut progress = |line: &str| out.progress(line, &mut in_dynamic_progress);
     let result = scan_with_progress(
-        root,
+        ctx.root,
         &mut manifest,
         &opts,
         &ignore,
-        manifest_abs,
+        ctx.manifest_abs,
         Some(&mut progress),
     );
     out.finish_dynamic_progress(&mut in_dynamic_progress);
-    report(out, cli, &result, false);
+    let different = report(out, cli, &result, false);
+    let mut json = out
+        .json
+        .then(|| scan_json(out, ctx, &opts, &result, different));
 
-    match cli.command {
+    let code = match cli.command {
         Command::Update => {
             if let Err(e) = apply_edits(cli, &mut manifest) {
-                out.line(&e);
+                out.error(Some(ctx.root), &e);
                 return 1;
             }
-            write_manifest(cli, out, manifest_path, &manifest)
+            let outcome = write_manifest(cli, out, ctx, &manifest);
+            if outcome == WriteOutcome::Failed {
+                return 1;
+            }
+            if let Some(m) = json.as_mut() {
+                m.insert(
+                    "manifest_written".into(),
+                    json!(outcome == WriteOutcome::Written),
+                );
+            }
+            outcome.code()
         }
-        Command::Groom => groom(cli, out, &result),
+        Command::Groom => groom(cli, out, &result, json.as_mut()),
         _ => 0, // status writes nothing
+    };
+    if let Some(m) = json {
+        out.emit(m);
     }
+    code
 }
 
 /// Implements `validate`: scan a copy for reporting, then bump only the
-/// validation date on the original manifest (unless --no-touch).
-fn cmd_validate(
-    cli: &Cli,
-    out: &Output,
-    manifest_path: &Path,
-    root: &Path,
-    manifest_abs: &Path,
-) -> i32 {
-    let mut original = match read_manifest(out, manifest_path) {
+/// validation date on the original manifest (unless --no-touch, or the scan
+/// was limited with --path).
+fn cmd_validate(cli: &Cli, out: &Output, ctx: &Ctx) -> i32 {
+    let mut original = match read_manifest(out, ctx) {
         Some(m) => m,
         None => return 1,
     };
-    let ignore = match IgnoreSet::compile(&original.ignore_list) {
-        Ok(i) => i,
-        Err(e) => {
-            out.line(&format!("Invalid ignore pattern: {e}"));
-            return 1;
-        }
+    let Some((ignore, opts)) = prepare_scan(cli, out, ctx, &original) else {
+        return 1;
     };
     let mut scanned = original.clone();
-    let opts = scan_options(cli);
     let mut in_dynamic_progress = false;
     let mut progress = |line: &str| out.progress(line, &mut in_dynamic_progress);
     let result = scan_with_progress(
-        root,
+        ctx.root,
         &mut scanned,
         &opts,
         &ignore,
-        manifest_abs,
+        ctx.manifest_abs,
         Some(&mut progress),
     );
     out.finish_dynamic_progress(&mut in_dynamic_progress);
@@ -386,52 +518,167 @@ fn cmd_validate(
         out.line("No problems.");
     }
 
-    let mut exit_code = if different { 1 } else { 0 };
+    let exit_code = if different { 1 } else { 0 };
+    let mut date_written = false;
 
-    if !cli.no_touch {
+    if !cli.no_touch && opts.scope.is_none() {
         original.last_validate_date_utc = Utc::now();
-        let code = write_manifest(cli, out, manifest_path, &original);
-        if code != 0 {
-            exit_code = code;
+        match write_manifest(cli, out, ctx, &original) {
+            WriteOutcome::Failed => return 1,
+            WriteOutcome::Written => date_written = true,
+            WriteOutcome::Declined => {}
         }
+    }
+
+    if out.json {
+        let mut m = scan_json(out, ctx, &opts, &result, different);
+        m.insert("problems".into(), json!(different));
+        m.insert("validation_date_written".into(), json!(date_written));
+        out.emit(m);
     }
     exit_code
 }
 
-fn groom(cli: &Cli, out: &Output, result: &ScanResult) -> i32 {
-    if !result.new_files_for_groom.is_empty() {
-        let proceed = cli.force
-            || confirm(
-                out,
-                &format!("Delete {} new files? ", result.new_files_for_groom.len()),
-            );
-        if proceed {
-            for path in &result.new_files_for_groom {
-                if let Err(e) = std::fs::remove_file(path) {
+/// Compiles the ignore list and builds the scan options, including the
+/// --path scope. Reports and returns `None` on an error.
+fn prepare_scan(
+    cli: &Cli,
+    out: &Output,
+    ctx: &Ctx,
+    manifest: &Manifest,
+) -> Option<(IgnoreSet, ScanOptions)> {
+    let ignore = match IgnoreSet::compile(&manifest.ignore_list) {
+        Ok(i) => i,
+        Err(e) => {
+            out.error(Some(ctx.root), &format!("Invalid ignore pattern: {e}"));
+            return None;
+        }
+    };
+    let mut opts = scan_options(cli);
+    if !cli.path.is_empty() {
+        let mut scope = ScanScope::new();
+        for p in &cli.path {
+            if let Err(e) = scope.add_user_path(ctx.root, manifest, p) {
+                out.error(Some(ctx.root), &e);
+                return None;
+            }
+        }
+        opts.scope = Some(scope);
+    }
+    Some((ignore, opts))
+}
+
+fn groom(
+    cli: &Cli,
+    out: &Output,
+    result: &ScanResult,
+    json: Option<&mut Map<String, Value>>,
+) -> i32 {
+    let mut deleted: Vec<String> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    let mut declined = false;
+
+    let mut delete_all = |paths: &[PathBuf], prompt: String, declined: &mut bool| {
+        if paths.is_empty() {
+            return;
+        }
+        if !(cli.force || confirm(out, &prompt)) {
+            *declined = true;
+            return;
+        }
+        for path in paths {
+            match std::fs::remove_file(path) {
+                Ok(()) => deleted.push(path.display().to_string()),
+                Err(e) => {
                     out.line(&format!("Could not delete {}: {e}", path.display()));
+                    failed
+                        .push(json!({"path": path.display().to_string(), "error": e.to_string()}));
                 }
             }
         }
+    };
+
+    delete_all(
+        &result.new_files_for_groom,
+        format!("Delete {} new files? ", result.new_files_for_groom.len()),
+        &mut declined,
+    );
+    if cli.all {
+        delete_all(
+            &result.ignored_files_for_groom,
+            format!(
+                "Delete {} ignored files? ",
+                result.ignored_files_for_groom.len()
+            ),
+            &mut declined,
+        );
     }
 
-    if cli.all && !result.ignored_files_for_groom.is_empty() {
-        let proceed = cli.force
-            || confirm(
-                out,
-                &format!(
-                    "Delete {} ignored files? ",
-                    result.ignored_files_for_groom.len()
-                ),
-            );
-        if proceed {
-            for path in &result.ignored_files_for_groom {
-                if let Err(e) = std::fs::remove_file(path) {
-                    out.line(&format!("Could not delete {}: {e}", path.display()));
-                }
-            }
-        }
+    if let Some(m) = json {
+        m.insert("deleted".into(), json!(deleted));
+        m.insert("delete_errors".into(), json!(failed));
+        m.insert("declined".into(), json!(declined));
     }
     0
+}
+
+/// The machine-readable form of a scan result.
+fn scan_json(
+    out: &Output,
+    ctx: &Ctx,
+    opts: &ScanOptions,
+    r: &ScanResult,
+    different: bool,
+) -> Map<String, Value> {
+    let mut m = json_base(out, ctx);
+    m.insert(
+        "scope".into(),
+        match &opts.scope {
+            Some(s) => json!({"dirs": s.dirs(), "files": s.files()}),
+            None => Value::Null,
+        },
+    );
+    m.insert("different".into(), json!(different));
+    m.insert("files_checked".into(), json!(r.files_checked));
+    m.insert("missing".into(), json!(r.missing_files));
+    m.insert("changed".into(), json!(r.changed_files));
+    m.insert("new".into(), json!(r.new_files));
+    m.insert("last_modified".into(), json!(r.last_modified_files));
+    m.insert("errors".into(), json!(r.error_files));
+    m.insert(
+        "moved".into(),
+        Value::Array(
+            r.moved_files
+                .iter()
+                .map(|s| {
+                    json!({
+                        "hash_type": s.hash.hash_type.as_str(),
+                        "hash": s.hash.to_hex(),
+                        "old_paths": s.old_paths,
+                        "new_paths": s.new_paths,
+                    })
+                })
+                .collect(),
+        ),
+    );
+    m.insert(
+        "duplicates".into(),
+        Value::Array(
+            r.duplicate_files
+                .iter()
+                .map(|s| {
+                    json!({
+                        "hash_type": s.hash.hash_type.as_str(),
+                        "hash": s.hash.to_hex(),
+                        "paths": s.paths,
+                    })
+                })
+                .collect(),
+        ),
+    );
+    m.insert("newly_ignored".into(), json!(r.newly_ignored_files));
+    m.insert("ignored".into(), json!(r.ignored_files));
+    m
 }
 
 fn scan_options(cli: &Cli) -> ScanOptions {
@@ -448,6 +695,7 @@ fn scan_options(cli: &Cli) -> ScanOptions {
         } else {
             1
         },
+        scope: None, // set from --path by prepare_scan
     }
 }
 
@@ -575,24 +823,43 @@ fn apply_edits(cli: &Cli, manifest: &mut Manifest) -> Result<(), String> {
     Ok(())
 }
 
-fn write_manifest(cli: &Cli, out: &Output, manifest_path: &Path, manifest: &Manifest) -> i32 {
-    if cli.confirm_update && !confirm(out, "Update manifest? ") {
-        return 0;
-    }
-    match manifest_io::write_manifest(manifest_path, manifest) {
-        Ok(()) => 0,
-        Err(e) => {
-            out.line(&format!("Could not write manifest: {e}"));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    Written,
+    /// The user (or --json/--silent, which answer prompts "no") declined.
+    Declined,
+    /// Already reported.
+    Failed,
+}
+
+impl WriteOutcome {
+    fn code(self) -> i32 {
+        if self == WriteOutcome::Failed {
             1
+        } else {
+            0
         }
     }
 }
 
-fn read_manifest(out: &Output, manifest_path: &Path) -> Option<Manifest> {
-    match manifest_io::read_manifest(manifest_path) {
+fn write_manifest(cli: &Cli, out: &Output, ctx: &Ctx, manifest: &Manifest) -> WriteOutcome {
+    if cli.confirm_update && !confirm(out, "Update manifest? ") {
+        return WriteOutcome::Declined;
+    }
+    match manifest_io::write_manifest(ctx.manifest_path, manifest) {
+        Ok(()) => WriteOutcome::Written,
+        Err(e) => {
+            out.error(Some(ctx.root), &format!("Could not write manifest: {e}"));
+            WriteOutcome::Failed
+        }
+    }
+}
+
+fn read_manifest(out: &Output, ctx: &Ctx) -> Option<Manifest> {
+    match manifest_io::read_manifest(ctx.manifest_path) {
         Ok(m) => Some(m),
         Err(e) => {
-            out.line(&format!("Could not read manifest: {e}"));
+            out.error(Some(ctx.root), &format!("Could not read manifest: {e}"));
             None
         }
     }
@@ -632,7 +899,8 @@ fn find_manifests(dir: &Path, cascade: bool, out: &mut Vec<PathBuf>) -> io::Resu
 }
 
 fn confirm(out: &Output, prompt: &str) -> bool {
-    if out.silent {
+    // Prompts would corrupt JSON output, so --json answers "no" like --silent.
+    if out.silent || out.json {
         return false;
     }
     print!("{prompt}");
@@ -646,23 +914,64 @@ fn confirm(out: &Output, prompt: &str) -> bool {
     }
 }
 
-/// Console output respecting the --silent and --detail flags.
+/// Console output respecting the --silent, --detail and --json flags. With
+/// --json, text lines are suppressed, stdout carries only JSON objects (one per
+/// line), and progress goes to stderr.
 struct Output {
     silent: bool,
     detail: bool,
+    json: bool,
+    command: Command,
 }
 
 impl Output {
     fn line(&self, msg: &str) {
-        if !self.silent {
+        if !self.silent && !self.json {
             println!("{msg}");
         }
     }
 
-    fn line_flush(&self, msg: &str) {
-        if !self.silent {
-            println!("{msg}");
+    /// Reports a failure: as text, or with --json as
+    /// `{"ok": false, "command": ..., "root": ..., "error": ...}`.
+    fn error(&self, root: Option<&Path>, msg: &str) {
+        if self.json {
+            let mut m = Map::new();
+            m.insert("ok".into(), json!(false));
+            m.insert("command".into(), json!(self.command.name()));
+            m.insert("root".into(), json!(root.map(|r| r.display().to_string())));
+            m.insert("error".into(), json!(msg));
+            self.emit(m);
+        } else {
+            self.line(msg);
+        }
+    }
+
+    /// Writes one JSON object on its own line (--json only).
+    fn emit(&self, m: Map<String, Value>) {
+        if self.json && !self.silent {
+            println!("{}", Value::Object(m));
             let _ = io::stdout().flush();
+        }
+    }
+
+    /// Progress text goes to stdout normally, and to stderr with --json.
+    fn write_progress(&self, msg: &str, newline: bool) {
+        if self.json {
+            let mut e = io::stderr();
+            let _ = if newline {
+                writeln!(e, "{msg}")
+            } else {
+                write!(e, "{msg}")
+            };
+            let _ = e.flush();
+        } else {
+            let mut o = io::stdout();
+            let _ = if newline {
+                writeln!(o, "{msg}")
+            } else {
+                write!(o, "{msg}")
+            };
+            let _ = o.flush();
         }
     }
 
@@ -671,21 +980,20 @@ impl Output {
             return;
         }
         if msg.starts_with('\r') {
-            print!("{msg}");
-            let _ = io::stdout().flush();
+            self.write_progress(msg, false);
             *in_dynamic_progress = !msg.ends_with('\n');
             return;
         }
         if *in_dynamic_progress {
-            println!();
+            self.write_progress("", true);
             *in_dynamic_progress = false;
         }
-        self.line_flush(msg);
+        self.write_progress(msg, true);
     }
 
     fn finish_dynamic_progress(&self, in_dynamic_progress: &mut bool) {
         if !self.silent && *in_dynamic_progress {
-            println!();
+            self.write_progress("", true);
             *in_dynamic_progress = false;
         }
     }

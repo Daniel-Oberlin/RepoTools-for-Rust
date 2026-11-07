@@ -21,6 +21,7 @@ use crate::hash::HashType;
 use crate::ignore::IgnoreSet;
 use crate::model::{FileHash, Manifest, ManifestDirectoryInfo, ManifestFileInfo};
 use crate::paths::{normalize_nfc, standard_file_path};
+use crate::scope::ScanScope;
 use crate::serde_fmt::dotnet_min_date;
 
 /// Allowance for difference between a date stored in the manifest and the
@@ -48,6 +49,9 @@ pub struct ScanOptions {
     pub show_progress: bool,
     /// Number of concurrent hash jobs to use for validation-style scans.
     pub hash_jobs: usize,
+    /// Limit the scan to part of the repository. Manifest entries outside the
+    /// scope are left untouched and not reported. `None` scans everything.
+    pub scope: Option<ScanScope>,
 }
 
 impl Default for ScanOptions {
@@ -61,6 +65,7 @@ impl Default for ScanOptions {
             track_duplicates: false,
             show_progress: false,
             hash_jobs: 1,
+            scope: None,
         }
     }
 }
@@ -161,7 +166,11 @@ pub fn scan_with_progress(
         track_duplicates(manifest, &mut acc.result);
     }
 
-    manifest.last_update_date_utc = Utc::now();
+    // A scoped scan only brought part of the manifest up to date, so it does
+    // not advance the repository-wide "last update" date.
+    if opts.scope.is_none() {
+        manifest.last_update_date_utc = Utc::now();
+    }
     acc.result
 }
 
@@ -256,10 +265,21 @@ fn update_recursive(
         }
     }
 
+    // With a scope, only files inside it are looked at; a directory that is
+    // merely on the way to the scope contributes nothing of its own.
+    let scope = opts.scope.as_ref();
+    let dir_in_scope = scope.is_none_or(|s| s.contains_dir(dir_prefix));
+    let file_in_scope =
+        |std_path: &str| dir_in_scope || scope.is_some_and(|s| s.contains_file(std_path));
+    let visit_dir = |child_prefix: &str| scope.is_none_or(|s| s.should_visit(child_prefix));
+
     // Process existing manifest file entries.
     let existing_names: Vec<String> = man_dir.files.keys().cloned().collect();
     for name in &existing_names {
         let std_path = standard_file_path(dir_prefix, name);
+        if !file_in_scope(&std_path) {
+            continue;
+        }
 
         let Some(fs_path) = fs_files.get(name) else {
             // Missing from the filesystem.
@@ -393,6 +413,9 @@ fn update_recursive(
     for sub_name in &sub_names {
         let fs_sub = fs_dirs.get(sub_name).map(|p| p.as_path());
         let child_prefix = format!("{dir_prefix}{sub_name}/");
+        if !visit_dir(&child_prefix) {
+            continue;
+        }
         {
             let sub = man_dir.subdirectories.get_mut(sub_name).unwrap();
             update_recursive(
@@ -422,6 +445,9 @@ fn update_recursive(
     for name in &new_file_names {
         let fs_path = fs_files.get(name).unwrap().clone();
         let std_path = standard_file_path(dir_prefix, name);
+        if !file_in_scope(&std_path) {
+            continue;
+        }
 
         if ignore.is_ignored(&std_path) {
             progress(acc, opts, &std_path, "IGNORED", on_progress);
@@ -512,6 +538,9 @@ fn update_recursive(
     for sub_name in &new_dir_names {
         let fs_sub = fs_dirs.get(sub_name).unwrap().clone();
         let child_prefix = format!("{dir_prefix}{sub_name}/");
+        if !visit_dir(&child_prefix) {
+            continue;
+        }
         let mut new_sub = ManifestDirectoryInfo::new(sub_name.clone());
         update_recursive(
             Some(&fs_sub),
@@ -605,7 +634,11 @@ fn process_deferred_hashes(
         .num_threads(opts.hash_jobs)
         .build()
         .expect("failed to build rayon pool")
-        .install(|| work.into_par_iter().map(run_deferred_hash_work).collect::<Vec<_>>());
+        .install(|| {
+            work.into_par_iter()
+                .map(run_deferred_hash_work)
+                .collect::<Vec<_>>()
+        });
 
     for result in results {
         apply_deferred_hash_result(manifest, opts, on_progress, acc, result);
@@ -709,13 +742,7 @@ fn apply_deferred_hash_result(
                     mf.file_length = fs_len;
                 }
                 Err(_) => {
-                    finish_hash_progress(
-                        acc,
-                        opts,
-                        &result.work.std_path,
-                        "ERROR",
-                        on_progress,
-                    );
+                    finish_hash_progress(acc, opts, &result.work.std_path, "ERROR", on_progress);
                     acc.result.error_files.push(result.work.std_path.clone());
                     mf.file_hash = None;
                     mf.last_modified_utc = fs_mtime;

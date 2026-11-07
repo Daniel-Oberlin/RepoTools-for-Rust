@@ -671,6 +671,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "repotools_manifest",
+ "serde",
  "tempfile",
 ]
 
@@ -684,6 +685,7 @@ dependencies = [
  "predicates",
  "repotools_manifest",
  "repotools_sync",
+ "serde_json",
  "tempfile",
 ]
 
@@ -697,6 +699,7 @@ dependencies = [
  "clap",
  "predicates",
  "repotools_manifest",
+ "serde_json",
  "tempfile",
 ]
 
