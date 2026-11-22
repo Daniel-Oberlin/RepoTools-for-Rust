@@ -9,12 +9,13 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use repotools_manifest::model::compare_manifest_dates;
+use repotools_manifest::ScanScope;
 
 use crate::diff::{compare_manifests, MovedFileSet};
 use crate::proxy::RepositoryProxy;
 
 /// Direction/behavior flags for a sync run.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SyncOptions {
     /// `sync`: propagate changes in both directions.
     pub both_ways: bool,
@@ -22,6 +23,10 @@ pub struct SyncOptions {
     pub mirror: bool,
     /// `--preview`: report intended actions without changing anything.
     pub preview: bool,
+    /// `--path`: act only on files inside this scope (by standard path, on
+    /// either side); everything else is left as it is, and the manifests'
+    /// metadata isn't copied.
+    pub scope: Option<ScanScope>,
 }
 
 /// A line-oriented progress logger.
@@ -133,14 +138,18 @@ pub fn do_update_events(
     opts: &SyncOptions,
     log: &mut EventSink,
 ) -> io::Result<()> {
-    let diff = compare_manifests(source.manifest(), dest.manifest());
+    let mut diff = compare_manifests(source.manifest(), dest.manifest());
+    if let Some(scope) = &opts.scope {
+        diff = diff.scoped(scope);
+    }
     let preview = opts.preview;
 
     // Manifest metadata: the destination adopts the source's metadata whenever
-    // they differ (matching the .NET behavior).
+    // they differ (matching the .NET behavior). Not for a scoped run, which
+    // touches only the files in its scope.
     let s_info = source.manifest().manifest_info_last_modified_utc;
     let d_info = dest.manifest().manifest_info_last_modified_utc;
-    if !compare_manifest_dates(s_info, d_info) {
+    if opts.scope.is_none() && !compare_manifest_dates(s_info, d_info) {
         log(&SyncEvent::UpdateManifestInfo);
         if !preview {
             let source_manifest = source.manifest().clone();

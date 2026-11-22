@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Map, Value};
 
 use repotools_manifest::model::compare_manifest_dates;
-use repotools_manifest::Manifest;
+use repotools_manifest::{Manifest, ScanScope};
 use repotools_sync::diff::SyncDiff;
 use repotools_sync::{
     compare_manifests, do_update_events, LocalRepositoryProxy, RepositoryProxy, SyncEvent,
@@ -47,6 +47,12 @@ struct Cli {
     /// to stderr).
     #[arg(long, global = true)]
     json: bool,
+    /// Limit diff, update, sync or mirror to this directory or file, relative
+    /// to the repository roots (repeatable). Files outside it are left as they
+    /// are and not reported; a file moved in or out of it is carried in full.
+    /// The manifests' metadata isn't copied.
+    #[arg(long, global = true, value_name = "PATH")]
+    path: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -171,7 +177,10 @@ fn cmd_diff(cli: &Cli, source: &Path, dest: &Path) -> anyhow::Result<i32> {
     let source_rep = LocalRepositoryProxy::open(source, true)?;
     let dest_rep = LocalRepositoryProxy::open(dest, true)?;
 
-    let diff = compare_manifests(source_rep.manifest(), dest_rep.manifest());
+    let mut diff = compare_manifests(source_rep.manifest(), dest_rep.manifest());
+    if let Some(scope) = build_scope(cli, &source_rep, &dest_rep)? {
+        diff = diff.scoped(&scope);
+    }
     let different = if cli.json {
         let (different, m) = diff_json(cli, source_rep.manifest(), dest_rep.manifest(), &diff);
         emit(cli, m);
@@ -182,9 +191,44 @@ fn cmd_diff(cli: &Cli, source: &Path, dest: &Path) -> anyhow::Result<i32> {
     Ok(if different { 1 } else { 0 })
 }
 
-/// Manifest-metadata differences, as (JSON key, text-report line).
-fn metadata_differences(source: &Manifest, dest: &Manifest) -> Vec<(&'static str, &'static str)> {
+/// The --path scope, if any. Each path is looked up in the source (on disk,
+/// then in its manifest) and, failing that, in the destination, so a path
+/// that only one side still has can be given.
+fn build_scope(
+    cli: &Cli,
+    source: &LocalRepositoryProxy,
+    dest: &LocalRepositoryProxy,
+) -> anyhow::Result<Option<ScanScope>> {
+    if cli.path.is_empty() {
+        return Ok(None);
+    }
+    let mut scope = ScanScope::new();
+    for p in &cli.path {
+        if scope
+            .add_user_path(source.root(), source.manifest(), p)
+            .is_err()
+        {
+            scope
+                .add_user_path(dest.root(), dest.manifest(), p)
+                .map_err(|_| {
+                    anyhow::anyhow!("Path is in neither repository nor their manifests: {p}")
+                })?;
+        }
+    }
+    Ok(Some(scope))
+}
+
+/// Manifest-metadata differences, as (JSON key, text-report line). None for a
+/// --path diff, which is about the files in its scope only.
+fn metadata_differences(
+    cli: &Cli,
+    source: &Manifest,
+    dest: &Manifest,
+) -> Vec<(&'static str, &'static str)> {
     let mut d = Vec::new();
+    if !cli.path.is_empty() {
+        return d;
+    }
     if source.name != dest.name {
         d.push(("name", "Manifest names are different."));
     }
@@ -225,7 +269,7 @@ fn diff_json(
     dest: &Manifest,
     diff: &SyncDiff,
 ) -> (bool, Map<String, Value>) {
-    let meta: Vec<&str> = metadata_differences(source, dest)
+    let meta: Vec<&str> = metadata_differences(cli, source, dest)
         .into_iter()
         .map(|(k, _)| k)
         .collect();
@@ -274,6 +318,8 @@ fn cmd_sync(
         fail(cli, "Source and destination GUIDs are different.");
         return Ok(1);
     }
+
+    opts.scope = build_scope(cli, &source_rep, &dest_rep)?;
 
     let silent = cli.silent;
     let json_mode = cli.json;
@@ -337,7 +383,7 @@ fn report_diff(cli: &Cli, source: &Manifest, dest: &Manifest, diff: &SyncDiff) -
         }
     };
 
-    for (_, msg) in metadata_differences(source, dest) {
+    for (_, msg) in metadata_differences(cli, source, dest) {
         line(msg);
         different = true;
     }

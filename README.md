@@ -131,6 +131,27 @@ Run `rs --help` for all commands and options.
 Library users get the same actions as `repotools_sync::SyncEvent` values from
 `do_update_events`.
 
+### Limiting a sync to part of the repositories
+
+`--path` (repeatable) limits `diff`, `update`, `sync` and `mirror` to a directory or file,
+relative to the repository roots (or absolute under either one):
+
+```sh
+rs update --preview --json --path "Music Collection/Funk/Purple Disco Machine/2021 - Exotica" <source> <dest>
+```
+
+- Only files inside the scope are compared, copied, replaced or (with `mirror`) removed.
+  Everything else is left exactly as it is, on both sides.
+- Each path is looked up in the source first (on disk, then in its manifest), then in the
+  destination. So a folder that only the destination still has (one renamed or removed in the
+  source) can be given.
+- A moved file is carried when either end is inside the scope, so a folder renamed in the
+  source follows whether its old or its new name is given.
+- The manifests' metadata (name, description, ignore list) isn't copied, and `diff` doesn't
+  report it.
+
+Library users set `SyncOptions::scope`, or call `SyncDiff::scoped`.
+
 ## Interoperability
 
 The manifest format is semantically interoperable with the .NET implementation. The test suite

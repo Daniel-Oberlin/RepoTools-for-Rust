@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use repotools_manifest::model::compare_manifest_dates;
-use repotools_manifest::{FileHash, Manifest, ManifestDirectoryInfo, ManifestFileInfo};
+use repotools_manifest::{FileHash, Manifest, ManifestDirectoryInfo, ManifestFileInfo, ScanScope};
 
 /// A set of files that appear to have moved between source and destination:
 /// the source locations and destination locations sharing one content hash.
@@ -42,6 +42,34 @@ impl SyncDiff {
             && self.last_modified.is_empty()
             && self.registered.is_empty()
             && self.moved.is_empty()
+    }
+}
+
+impl SyncDiff {
+    /// Only the differences inside `scope`. A moved file is kept when either
+    /// end is inside it (so a folder renamed on one side follows when either
+    /// its old or its new name is given), and its whole set is kept with it.
+    pub fn scoped(self, scope: &ScanScope) -> SyncDiff {
+        let keep = |v: Vec<String>| -> Vec<String> {
+            v.into_iter().filter(|p| scope.contains_file(p)).collect()
+        };
+        SyncDiff {
+            source_only: keep(self.source_only),
+            dest_only: keep(self.dest_only),
+            changed: keep(self.changed),
+            last_modified: keep(self.last_modified),
+            registered: keep(self.registered),
+            moved: self
+                .moved
+                .into_iter()
+                .filter(|s| {
+                    s.source_paths
+                        .iter()
+                        .chain(s.dest_paths.iter())
+                        .any(|p| scope.contains_file(p))
+                })
+                .collect(),
+        }
     }
 }
 

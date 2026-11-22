@@ -40,6 +40,11 @@ impl LocalRepositoryProxy {
         })
     }
 
+    /// The repository's root folder (canonicalized).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Creates a seed (empty) repository at `dest_dir` cloned from `source`:
     /// same GUID and metadata, empty file tree, reset update date. Errors if a
     /// manifest already exists there. Mirrors `SeedLocalRepository`.

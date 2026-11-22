@@ -350,3 +350,147 @@ fn json_guid_mismatch_is_an_error_object() {
     assert_eq!(o["ok"], false);
     assert!(o["error"].as_str().unwrap().contains("GUIDs"));
 }
+
+/// Source and dest in sync with albums A and B; then both change in source.
+fn two_albums_changed() -> (TempDir, TempDir) {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    build_repo(src.path(), &[("A/1.txt", "a1\n"), ("B/1.txt", "b1\n")]);
+    rs().arg("seed")
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+    rs().arg("update")
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write(src.path(), "A/1.txt", "a1 changed\n");
+    write(src.path(), "A/2.txt", "a2\n");
+    write(src.path(), "B/1.txt", "b1 changed\n");
+    write(src.path(), "B/2.txt", "b2\n");
+    rescan(src.path());
+    (src, dst)
+}
+
+#[test]
+fn path_limits_diff_and_update_to_the_scope() {
+    let (src, dst) = two_albums_changed();
+
+    let (code, d) = rs_json(&["diff", "--path", "A"], src.path(), dst.path());
+    assert_eq!(code, 1);
+    assert_eq!(d["source_only"], serde_json::json!(["./A/2.txt"]));
+    assert_eq!(d["changed"], serde_json::json!(["./A/1.txt"]));
+    assert!(d["metadata_differences"].as_array().unwrap().is_empty());
+
+    let (code, u) = rs_json(&["update", "--path", "A"], src.path(), dst.path());
+    assert_eq!(code, 0);
+    let actions = u["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 2, "{actions:?}");
+    assert!(actions
+        .iter()
+        .all(|a| a["path"].as_str().unwrap().starts_with("./A/")));
+
+    assert_eq!(
+        fs::read_to_string(dst.path().join("A/1.txt")).unwrap(),
+        "a1 changed\n"
+    );
+    assert!(dst.path().join("A/2.txt").is_file());
+    assert_eq!(
+        fs::read_to_string(dst.path().join("B/1.txt")).unwrap(),
+        "b1\n"
+    );
+    assert!(!dst.path().join("B/2.txt").exists());
+
+    let (code, _) = rs_json(&["diff", "--path", "A"], src.path(), dst.path());
+    assert_eq!(code, 0);
+    let (code, d) = rs_json(&["diff"], src.path(), dst.path());
+    assert_eq!(code, 1);
+    assert_eq!(d["source_only"], serde_json::json!(["./B/2.txt"]));
+}
+
+#[test]
+fn path_scoped_mirror_removes_only_inside_the_scope() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    build_repo(
+        src.path(),
+        &[
+            ("A/1.txt", "a1\n"),
+            ("A/x.txt", "x\n"),
+            ("B/1.txt", "b1\n"),
+            ("B/y.txt", "y\n"),
+        ],
+    );
+    rs().arg("seed")
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+    rs().arg("update")
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+    fs::remove_file(src.path().join("A/x.txt")).unwrap();
+    fs::remove_file(src.path().join("B/y.txt")).unwrap();
+    rescan(src.path());
+
+    let (code, _) = rs_json(&["mirror", "--path", "A"], src.path(), dst.path());
+    assert_eq!(code, 0);
+    assert!(!dst.path().join("A/x.txt").exists());
+    assert!(dst.path().join("B/y.txt").is_file());
+}
+
+#[test]
+fn path_scope_follows_a_renamed_folder_by_either_name() {
+    for given in ["new", "old"] {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        build_repo(src.path(), &[("old/a.txt", "A\n"), ("other/b.txt", "B\n")]);
+        rs().arg("seed")
+            .arg(src.path())
+            .arg(dst.path())
+            .assert()
+            .success();
+        rs().arg("update")
+            .arg(src.path())
+            .arg(dst.path())
+            .assert()
+            .success();
+        fs::rename(src.path().join("old"), src.path().join("new")).unwrap();
+        fs::rename(
+            src.path().join("other/b.txt"),
+            src.path().join("other/c.txt"),
+        )
+        .unwrap();
+        rescan(src.path());
+
+        // "old" is only in the destination (and its manifest) now.
+        let (code, u) = rs_json(&["update", "--path", given], src.path(), dst.path());
+        assert_eq!(code, 0, "{u}");
+        let actions = u["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 1, "{given}: {actions:?}");
+        assert_eq!(actions[0]["action"], "move");
+        assert_eq!(actions[0]["to"], "./new/a.txt");
+        assert!(dst.path().join("other/b.txt").is_file()); // outside: untouched
+    }
+}
+
+#[test]
+fn path_in_neither_repository_is_an_error() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    build_repo(src.path(), &[("a.txt", "A\n")]);
+    rs().arg("seed")
+        .arg(src.path())
+        .arg(dst.path())
+        .assert()
+        .success();
+    let (code, r) = rs_json(&["update", "--path", "nope"], src.path(), dst.path());
+    assert_eq!(code, 1);
+    assert_eq!(r["ok"], false);
+    assert!(r["error"].as_str().unwrap().contains("nope"));
+}
